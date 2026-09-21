@@ -935,6 +935,338 @@ function filterRaw() {
     : lines.length + " lines" + (lines.length > LIMIT ? ", showing first " + LIMIT : "");
 }
 
+
+/* ---------------------------------------------------------------- live -- */
+
+/* The browser polls the server; the server polls the device on its own
+   adaptive cadence. These are deliberately decoupled, so a page left open
+   never increases the load on the phone. */
+
+var live = {
+  timer: null, since: 0, selected: null, focus: null,
+  starting: false, lastSeen: 0
+};
+
+var EV_COLOUR = {
+  anr: "var(--alarm)", crash: "var(--alarm)", cpu: "var(--cpu)",
+  wakelock: "var(--wakelock)", level: "var(--screen)", screen: "var(--idle)",
+  doze: "var(--wifi)", job: "var(--cpu)", alarm: "var(--sensors)",
+  jank: "var(--wakelock)", info: "var(--idle)"
+};
+
+function liveFetchDevices() {
+  var box = $("#live-devices");
+  box.className = "empty";
+  box.textContent = "Looking for devices.";
+  fetch("/api/live/devices").then(function (r) {
+    return r.json().then(function (j) { return { ok: r.ok, body: j }; });
+  }).then(function (res) {
+    if (!res.ok) {
+      box.className = "empty";
+      box.textContent = res.body.error || "Could not list devices.";
+      return;
+    }
+    var devices = res.body.devices || [];
+    box.className = "";
+    box.textContent = "";
+    if (!devices.length) {
+      box.className = "empty";
+      box.textContent = "No device found. Connect one and enable usb debugging, " +
+        "or pair over wireless adb, then rescan.";
+      return;
+    }
+    devices.forEach(function (d, i) {
+      var row = el("div", "dev-row");
+      row.setAttribute("aria-selected", String(i === 0));
+      if (i === 0) live.selected = d.serial;
+      var name = el("span", null, d.model || d.serial);
+      name.style.fontWeight = "550";
+      row.appendChild(name);
+      row.appendChild(el("span", "mono faint", d.serial));
+      row.appendChild(el("span", "state", d.state));
+      row.addEventListener("click", function () {
+        live.selected = d.serial;
+        box.querySelectorAll(".dev-row").forEach(function (r2) {
+          r2.setAttribute("aria-selected", String(r2 === row));
+        });
+      });
+      box.appendChild(row);
+    });
+  }).catch(function (err) {
+    box.className = "empty";
+    box.textContent = "Could not reach the server: " + err;
+  });
+}
+
+function liveStart() {
+  if (live.starting) return;
+  var err = $("#live-error");
+  err.textContent = "";
+  if (!live.selected) { err.textContent = "Select a device first."; return; }
+  live.starting = true;
+  $("#live-start").textContent = "Connecting";
+  fetch("/api/live/start", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      serial: live.selected,
+      unplug: $("#live-unplug").checked,
+      logcat: $("#live-logcat").checked
+    })
+  }).then(function (r) {
+    return r.json().then(function (j) { return { ok: r.ok, body: j }; });
+  }).then(function (res) {
+    live.starting = false;
+    $("#live-start").textContent = "Start session";
+    if (!res.ok) { err.textContent = res.body.error || "Could not start."; return; }
+    live.since = 0;
+    $("#live-setup").hidden = true;
+    $("#live-running").hidden = false;
+    livePoll();
+    live.timer = setInterval(livePoll, 2000);
+  }).catch(function (e) {
+    live.starting = false;
+    $("#live-start").textContent = "Start session";
+    err.textContent = "Could not start: " + e;
+  });
+}
+
+function liveStop() {
+  clearInterval(live.timer);
+  live.timer = null;
+  fetch("/api/live/stop", { method: "POST" }).then(function () {
+    $("#live-running").hidden = true;
+    $("#live-setup").hidden = false;
+    $("#n-live").textContent = "";
+    toast("Session stopped, charging restored");
+    liveFetchDevices();
+  });
+}
+
+function livePoll() {
+  fetch("/api/live/state?since=" + live.since).then(function (r) { return r.json(); })
+    .then(function (s) {
+      if (!s.running) {
+        clearInterval(live.timer);
+        live.timer = null;
+        $("#live-running").hidden = true;
+        $("#live-setup").hidden = false;
+        return;
+      }
+      live.since = s.seq;
+      liveRender(s);
+    }).catch(function () { /* transient, next tick retries */ });
+}
+
+function liveRender(s) {
+  var d = s.device || {};
+  $("#live-device").textContent = (d.model || d.serial || "device") +
+    (d.android ? "  \u00b7  Android " + d.android : "");
+  $("#live-mode").textContent = (s.dozing ? "dozing" : s.screen_on ? "screen on" : "screen off") +
+    "  \u00b7  polling every " + s.interval + "s" +
+    (s.unplug_applied ? "  \u00b7  charging masked" : "");
+  $("#live-uptime").textContent = clock(s.uptime_s * 1000);
+  $("#n-live").textContent = "\u25cf";
+
+  var dot = $("#live-dot");
+  dot.className = "live-dot" + (s.error ? " dead" : s.dozing ? " stale" : "");
+
+  var l = s.latest || {};
+  var metrics = [
+    ["Current draw", l.current_ma != null ? Math.round(l.current_ma) + " mA" : "\u2013",
+      s.current_source ? "from battery gauge" : "gauge not readable"],
+    ["Drain rate", s.drain_pct_hr != null ? s.drain_pct_hr.toFixed(2) + " %/hr" : "measuring",
+      s.drain_pct_hr == null ? "needs a level drop" : "observed"],
+    ["Level", l.level != null ? l.level + "%" : "\u2013", l.status || ""],
+    ["Battery temp", l.temp_c != null ? l.temp_c.toFixed(1) + "\u00b0C" : "\u2013",
+      l.voltage_mv ? (l.voltage_mv / 1000).toFixed(2) + " V" : ""]
+  ];
+  var mbox = $("#live-metrics");
+  mbox.textContent = "";
+  metrics.forEach(function (m) {
+    var c = el("div", "metric");
+    c.appendChild(el("div", "label", m[0]));
+    c.appendChild(el("div", "value", m[1]));
+    c.appendChild(el("div", "foot", m[2]));
+    mbox.appendChild(c);
+  });
+
+  liveTrace(s.trend || []);
+  liveProcs(l.procs || []);
+  liveLocks(l.wakelocks || []);
+  liveEvents(s.events || []);
+  liveOverhead(s.overhead || {});
+}
+
+function liveTrace(trend) {
+  var host = $("#live-trace");
+  host.textContent = "";
+  var pts = trend.filter(function (p) { return p.current_ma != null; });
+  if (pts.length < 2) {
+    host.appendChild(emptyNote("Waiting for a second reading."));
+    return;
+  }
+  var W = 640, H = 110, pad = 6;
+  var max = Math.max.apply(null, pts.map(function (p) { return p.current_ma; }));
+  var min = Math.min.apply(null, pts.map(function (p) { return p.current_ma; }));
+  var span = Math.max(1, max - min);
+  var t0 = pts[0].t, t1 = pts[pts.length - 1].t;
+  var tspan = Math.max(1, t1 - t0);
+
+  var svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("viewBox", "0 0 " + W + " " + H);
+  svg.setAttribute("role", "img");
+  svg.setAttribute("aria-label", "Current draw over the session");
+  svg.style.cssText = "width:100%;height:110px;display:block";
+
+  // Shade screen-on stretches so spikes can be read in context.
+  var runStart = null;
+  pts.forEach(function (p, i) {
+    var x = pad + ((p.t - t0) / tspan) * (W - pad * 2);
+    if (p.screen_on && runStart === null) runStart = x;
+    if ((!p.screen_on || i === pts.length - 1) && runStart !== null) {
+      var rect = document.createElementNS("http://www.w3.org/2000/svg", "rect");
+      rect.setAttribute("x", runStart);
+      rect.setAttribute("y", 0);
+      rect.setAttribute("width", Math.max(1, x - runStart));
+      rect.setAttribute("height", H - 14);
+      rect.setAttribute("fill", "var(--screen)");
+      rect.setAttribute("opacity", "0.10");
+      svg.appendChild(rect);
+      runStart = null;
+    }
+  });
+
+  var dstr = pts.map(function (p, i) {
+    var x = pad + ((p.t - t0) / tspan) * (W - pad * 2);
+    var y = (H - 18) - ((p.current_ma - min) / span) * (H - 30);
+    return (i ? "L" : "M") + x.toFixed(1) + "," + y.toFixed(1);
+  }).join(" ");
+  var path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+  path.setAttribute("d", dstr);
+  path.setAttribute("fill", "none");
+  path.setAttribute("stroke", "var(--cpu)");
+  path.setAttribute("stroke-width", "1.8");
+  svg.appendChild(path);
+  host.appendChild(svg);
+
+  var foot = el("div", "faint");
+  foot.style.cssText = "display:flex;justify-content:space-between;font-size:11px;font-family:var(--mono)";
+  foot.appendChild(el("span", null, Math.round(min) + " mA"));
+  foot.appendChild(el("span", null, "peak " + Math.round(max) + " mA"));
+  host.appendChild(foot);
+}
+
+function liveProcs(procs) {
+  var host = $("#live-top");
+  host.textContent = "";
+  if (!procs.length) {
+    host.appendChild(emptyNote("No process samples yet."));
+    return;
+  }
+  var max = Math.max.apply(null, procs.map(function (p) { return p.cpu; }).concat([1]));
+  procs.forEach(function (p) {
+    var row = el("div", "live-proc");
+    row.setAttribute("aria-selected", String(live.focus === p.name));
+    row.appendChild(el("span", "mono", p.name || p.pid));
+    var right = el("span", "dim num");
+    right.style.marginLeft = "auto";
+    right.textContent = p.cpu.toFixed(0) + "%";
+    row.appendChild(right);
+    var bar = el("div", "bar");
+    bar.style.width = "72px";
+    var seg = el("span");
+    seg.style.width = pct(p.cpu, max) + "%";
+    seg.style.background = "var(--cpu)";
+    bar.appendChild(seg);
+    row.appendChild(bar);
+    row.addEventListener("click", function () { liveFocus(p.name); });
+    host.appendChild(row);
+  });
+}
+
+function liveFocus(pkg) {
+  var next = live.focus === pkg ? null : pkg;
+  fetch("/api/live/focus", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ package: next })
+  }).then(function (r) { return r.json(); }).then(function (j) {
+    live.focus = next;
+    toast(next ? (j.pid ? "Logcat filtered to " + next + " (pid " + j.pid + ")"
+                        : next + " is not running, filter cleared")
+               : "Logcat filter cleared");
+  });
+}
+
+function liveLocks(locks) {
+  var host = $("#live-locks");
+  host.textContent = "";
+  var title = el("div", "faint");
+  title.style.cssText = "font-size:12px;margin-bottom:6px";
+  title.textContent = locks.length ? "Wakelocks held right now" : "No wakelocks held right now";
+  host.appendChild(title);
+  locks.forEach(function (w) {
+    var row = el("div");
+    row.style.cssText = "display:flex;gap:10px;font-size:12.5px;padding:3px 0";
+    var tag = el("span", "mono", w.tag);
+    row.appendChild(tag);
+    if (w.package) {
+      var pk = el("span", "faint");
+      pk.style.marginLeft = "auto";
+      pk.textContent = w.package;
+      row.appendChild(pk);
+    }
+    host.appendChild(row);
+  });
+}
+
+function liveEvents(events) {
+  var host = $("#live-events");
+  if (!events.length && host.children.length) return;
+  events.slice().reverse().forEach(function (e) {
+    var row = el("div", "ev");
+    var when = new Date(e.t * 1000);
+    var pad = function (n) { return (n < 10 ? "0" : "") + n; };
+    row.appendChild(el("span", "when",
+      pad(when.getHours()) + ":" + pad(when.getMinutes()) + ":" + pad(when.getSeconds())));
+    var pip = el("span", "pip");
+    pip.style.background = EV_COLOUR[e.kind] || "var(--idle)";
+    row.appendChild(pip);
+    var body = el("span", "body");
+    var lbl = el("b", null, e.label);
+    lbl.style.fontWeight = "550";
+    body.appendChild(lbl);
+    body.appendChild(document.createTextNode("  " + (e.text || "")));
+    row.appendChild(body);
+    host.insertBefore(row, host.firstChild);
+  });
+  while (host.children.length > 200) host.removeChild(host.lastChild);
+  if (!host.children.length) host.appendChild(emptyNote("Nothing yet."));
+}
+
+function liveOverhead(o) {
+  var host = $("#live-overhead");
+  host.textContent = "";
+  var items = [
+    ["Shell commands", (o.commands || 0).toLocaleString(), (o.commands_per_min || 0) + " per minute"],
+    ["Device shell time", (o.shell_ms_per_min || 0) + " ms/min", "time the shell was busy"],
+    ["Duty cycle", (o.duty_pct || 0).toFixed(2) + "%", "of session spent polling"],
+    ["Total", (o.shell_seconds || 0).toFixed(1) + "s", "since session start"]
+  ];
+  items.forEach(function (m) {
+    var c = el("div", "metric");
+    c.appendChild(el("div", "label", m[0]));
+    c.appendChild(el("div", "value", m[1]));
+    c.appendChild(el("div", "foot", m[2]));
+    host.appendChild(c);
+  });
+}
+
+function renderLive() {
+  liveFetchDevices();
+}
+
 /* -------------------------------------------------------------- routing -- */
 
 var RENDERED = {};
@@ -945,7 +1277,8 @@ var RENDERERS = {
   wakelocks: renderWakelocks,
   wakeups: renderWakeups,
   daily: renderDaily,
-  raw: renderRaw
+  raw: renderRaw,
+  live: renderLive
 };
 
 function show(view) {
@@ -955,7 +1288,9 @@ function show(view) {
   document.querySelectorAll("#nav button").forEach(function (b) {
     b.setAttribute("aria-current", b.dataset.view === view ? "true" : "false");
   });
-  if (report && RENDERERS[view] && !RENDERED[view]) {
+  if (view === "live") {
+    if (!RENDERED.live) { renderLive(); RENDERED.live = true; }
+  } else if (report && RENDERERS[view] && !RENDERED[view]) {
     RENDERERS[view]();
     RENDERED[view] = true;
   } else if (report && view === "raw") {
@@ -1047,6 +1382,21 @@ document.addEventListener("DOMContentLoaded", function () {
   $("#file").addEventListener("change", function (e) {
     if (e.target.files[0]) upload(e.target.files[0]);
     e.target.value = "";
+  });
+
+  $("#live-start").addEventListener("click", liveStart);
+  $("#live-stop").addEventListener("click", liveStop);
+  $("#live-refresh").addEventListener("click", liveFetchDevices);
+  $("#live-sync").addEventListener("click", function () {
+    toast("Pulling full batterystats");
+    fetch("/api/live/deep-sync", { method: "POST" })
+      .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, body: j }; }); })
+      .then(function (res) {
+        if (!res.ok) { toast(res.body.error || "Deep sync failed"); return; }
+        RENDERED = {}; RENDERED.live = true;
+        load();
+        toast("Loaded into the static views, " + res.body.sections + " sections");
+      });
   });
 
   $("#raw-search").addEventListener("input", function () {

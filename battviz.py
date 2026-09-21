@@ -18,7 +18,7 @@ import threading
 import webbrowser
 import socketserver
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
 
 try:
     # Python 3.7+
@@ -29,9 +29,14 @@ except ImportError:
         daemon_threads = True
 
 import parser as bsparser
+import live as livemod
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-STATIC = os.path.join(HERE, "static")
+# Accept either layout: a proper static/ subfolder, or the static files
+# dropped flat next to battviz.py (common when files are saved individually
+# rather than as a folder).
+_STATIC_SUBDIR = os.path.join(HERE, "static")
+STATIC = _STATIC_SUBDIR if os.path.isfile(os.path.join(_STATIC_SUBDIR, "index.html")) else HERE
 
 MIME = {
     ".html": "text/html; charset=utf-8",
@@ -46,6 +51,11 @@ MIME = {
 # concurrently.
 _state = {"report": None, "source": None, "raw": ""}
 _state_lock = threading.Lock()
+
+# The live session is global and single: one device, one poll loop. Starting a
+# second would double the device-side cost for no extra information.
+_live = {"session": None}
+_live_lock = threading.Lock()
 
 MAX_UPLOAD = 64 * 1024 * 1024
 
@@ -147,6 +157,21 @@ class Handler(BaseHTTPRequestHandler):
             with _state_lock:
                 raw = _state["raw"]
             return self._send(200, raw, "text/plain; charset=utf-8")
+        if path == "/api/live/devices":
+            try:
+                return self._json(200, {"devices": livemod.list_devices()})
+            except livemod.AdbError as exc:
+                return self._json(502, {"error": str(exc)})
+        if path == "/api/live/state":
+            with _live_lock:
+                session = _live["session"]
+            if session is None:
+                return self._json(200, {"running": False})
+            try:
+                since = int(parse_qs(urlparse(self.path).query).get("since", ["0"])[0])
+            except ValueError:
+                since = 0
+            return self._json(200, session.snapshot(since))
         if path == "/api/adb":
             try:
                 text = pull_via_adb()
@@ -156,8 +181,67 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, {"ok": True, "source": report["meta"]["source"]})
         return self._static(path)
 
+    def _read_json_body(self):
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            return {}
+        if length <= 0 or length > 1024 * 64:
+            return {}
+        try:
+            return json.loads(self.rfile.read(length).decode("utf-8", "replace"))
+        except ValueError:
+            return {}
+
     def do_POST(self):
         path = urlparse(self.path).path
+
+        if path == "/api/live/start":
+            body = self._read_json_body()
+            with _live_lock:
+                if _live["session"] is not None and _live["session"].running:
+                    return self._json(409, {"error": "a live session is already running"})
+                session = livemod.LiveSession(
+                    serial=body.get("serial") or None,
+                    unplug=bool(body.get("unplug", True)),
+                    watch_logcat=bool(body.get("logcat", True)))
+                try:
+                    session.start()
+                except livemod.AdbError as exc:
+                    return self._json(502, {"error": str(exc)})
+                except Exception as exc:  # noqa: BLE001
+                    return self._json(500, {"error": "could not start session: %s" % exc})
+                _live["session"] = session
+            return self._json(200, {"ok": True, "device": session.device_info})
+
+        if path == "/api/live/stop":
+            with _live_lock:
+                session = _live["session"]
+                _live["session"] = None
+            if session is None:
+                return self._json(200, {"ok": True})
+            session.stop()
+            return self._json(200, {"ok": True})
+
+        if path == "/api/live/focus":
+            body = self._read_json_body()
+            with _live_lock:
+                session = _live["session"]
+            if session is None:
+                return self._json(409, {"error": "no live session"})
+            return self._json(200, session.focus(body.get("package")))
+
+        if path == "/api/live/deep-sync":
+            with _live_lock:
+                session = _live["session"]
+            if session is None:
+                return self._json(409, {"error": "no live session"})
+            text = session.deep_sync()
+            if not text:
+                return self._json(502, {"error": "deep sync returned nothing"})
+            report = set_report(text, "live deep sync")
+            return self._json(200, {"ok": True, "sections": len(report["sections"])})
+
         if path != "/api/upload":
             return self._send(404, "not found")
         try:
@@ -193,6 +277,16 @@ def main(argv=None):
     ap.add_argument("--no-browser", action="store_true")
     args = ap.parse_args(argv)
 
+    if not os.path.isfile(os.path.join(STATIC, "index.html")):
+        sys.exit(
+            "cannot find index.html.\n"
+            "  looked in: %s\n"
+            "  battviz.py is in: %s\n"
+            "  fix: make sure index.html, style.css and app.js sit either in "
+            "a static/ subfolder next to battviz.py, or directly next to it."
+            % (STATIC, HERE)
+        )
+
     if args.adb:
         set_report(pull_via_adb(), "adb: connected device")
     elif args.dump:
@@ -224,6 +318,12 @@ def main(argv=None):
         httpd.serve_forever()
     except KeyboardInterrupt:
         print("\nstopped", file=sys.stderr)
+        with _live_lock:
+            session = _live["session"]
+        if session is not None:
+            # Restores `dumpsys battery reset` so the device is not left
+            # believing it is unplugged.
+            session.stop()
         httpd.server_close()
 
 

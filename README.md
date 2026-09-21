@@ -39,6 +39,55 @@ Unplug before you start. If the battery level never moves during the window,
 Android reports zero measured discharge and every ranking becomes modelled
 rather than measured — battviz flags this on the overview when it happens.
 
+## Live mode
+
+`Live` in the sidebar watches a connected device while it drains, instead of
+reading a dump after the fact. Pick a device, start the session, and it polls
+in the background while showing current draw, the processes burning cpu right
+now, wakelocks currently held, and a merged event stream from logcat.
+
+Select any process to filter logcat to that app's pid. `Deep sync` pulls a
+full batterystats on demand and loads it into the normal static views, so a
+live session can end as a saved report.
+
+### Keeping the analyser out of the results
+
+Watching a device costs the device something. Four things keep that cost low
+enough not to distort the measurement:
+
+- **One persistent shell.** A single long-lived `adb shell` handles every
+  sample. Spawning `adb shell` per poll would cost a USB round trip plus a
+  fork on the device each time, which dwarfs the data being read.
+- **Adaptive cadence.** Polling a screen-off device holds it out of doze, so
+  the interval stretches from 2s with the screen on, to 10s screen off, to 30s
+  while dozing. That is 1800 commands an hour down to 120.
+- **Cheap sources only.** `dumpsys batterystats` is around 200KB and expensive,
+  so it is never polled, only read on an explicit deep sync. Each tick reads
+  `dumpsys battery`, one sysfs current file, a grepped wakelock section and a
+  row-capped `top`, all in one round trip. Filtering runs on the device so
+  less crosses the wire.
+- **The overhead is shown, not assumed.** The session counts its own shell
+  commands and measures the time the device shell spent busy, and reports both
+  as a duty-cycle percentage. If the tool is costing more than it is finding,
+  that is visible on screen.
+
+### Charging makes drain unmeasurable
+
+A wired device is charging, so there is no discharge to observe and every rate
+reads as zero. Two ways around it:
+
+- **Wireless adb**, the honest option, since the device is genuinely unplugged:
+  `adb tcpip 5555` then `adb connect <phone-ip>:5555`, then unplug the cable.
+- **Mask charging**, on by default for wired sessions. The session runs
+  `dumpsys battery unplug` so the framework behaves as though on battery.
+  Stopping the session runs `dumpsys battery reset` to undo it, and that also
+  runs on ctrl-c and on process exit. If a session is ever killed hard, run
+  `adb shell dumpsys battery reset` yourself to restore normal charging.
+
+Drain rate stays at "measuring" until there is a real window to measure: at
+least two percent of drop across at least five minutes. One percent over
+twenty seconds extrapolates to a confident and meaningless number.
+
 ## The views
 
 **Overview** — time on battery, screen-on share, idle share and drain, then the
@@ -87,6 +136,7 @@ OPlus/MediaTek dump with all ten sections present.
 ```
 battviz.py          CLI and HTTP server
 parser.py           dump parser and culprit scoring
+live.py             live adb session, polling and logcat
 static/index.html   page shell
 static/style.css    palette and layout
 static/app.js       views, charts, timeline interaction

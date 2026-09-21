@@ -25,6 +25,7 @@
       <button data-view="wakeups">Wakeups <span class="count" id="n-wakeups"></span></button>
       <button data-view="daily">Daily drain <span class="count" id="n-daily"></span></button>
       <button data-view="raw">Raw dump</button>
+      <button data-view="live">Live <span class="count" id="n-live"></span></button>
     </nav>
 
     <div class="rail-foot">
@@ -135,6 +136,67 @@
         <input id="raw-search" type="search" placeholder="filter lines, e.g. wake_lock or com.google" autocomplete="off">
         <div id="raw-count" class="faint" style="font-size:12px;margin-bottom:8px"></div>
         <div id="raw-out"></div>
+      </div>
+    </section>
+
+    <section class="view" id="view-live">
+      <header>
+        <h1>Live session</h1>
+        <p>Watches a connected device while it drains. Polls slow down when the screen is off so the analyser does not hold the device awake and cause the drain it is measuring.</p>
+      </header>
+
+      <div class="panel" id="live-setup">
+        <h2>Connect a device</h2>
+        <p class="sub">Wireless adb is best, since a wired device is charging. Over USB, mask charging instead.</p>
+        <div id="live-devices" class="empty">Looking for devices.</div>
+        <div style="margin-top:14px; display:flex; gap:18px; flex-wrap:wrap; align-items:center">
+          <label class="live-opt"><input type="checkbox" id="live-unplug" checked> Mask charging while wired</label>
+          <label class="live-opt"><input type="checkbox" id="live-logcat" checked> Watch logcat</label>
+        </div>
+        <div style="margin-top:14px; display:flex; gap:10px; align-items:center">
+          <button type="button" id="live-start" class="primary">Start session</button>
+          <button type="button" id="live-refresh">Rescan</button>
+          <span id="live-error" class="live-err"></span>
+        </div>
+      </div>
+
+      <div id="live-running" hidden>
+        <div class="panel">
+          <div class="live-head">
+            <span class="live-dot" id="live-dot"></span>
+            <span id="live-device"></span>
+            <span class="mono faint" id="live-mode"></span>
+            <span class="mono faint" id="live-uptime" style="margin-left:auto"></span>
+            <button type="button" id="live-sync">Deep sync</button>
+            <button type="button" id="live-stop">Stop session</button>
+          </div>
+          <div class="grid m4" id="live-metrics" style="margin-top:14px"></div>
+        </div>
+
+        <div class="panel">
+          <h2>Current draw</h2>
+          <p class="sub">Instantaneous milliamps read from the battery gauge. Shaded bands are screen-on periods.</p>
+          <div id="live-trace"></div>
+        </div>
+
+        <div class="panel">
+          <h2>Live culprits</h2>
+          <p class="sub">Top processes by cpu right now, plus wakelocks currently held. Select one to filter logcat to it.</p>
+          <div id="live-top"></div>
+          <div id="live-locks" style="margin-top:14px"></div>
+        </div>
+
+        <div class="panel">
+          <h2>Event stream</h2>
+          <p class="sub">Cpu spikes, level drops, screen changes and anything notable from logcat, on one clock.</p>
+          <div id="live-events"></div>
+        </div>
+
+        <div class="panel">
+          <h2>Analyser overhead</h2>
+          <p class="sub">What this tool is costing the device it is measuring.</p>
+          <div class="grid m4" id="live-overhead"></div>
+        </div>
       </div>
     </section>
 
