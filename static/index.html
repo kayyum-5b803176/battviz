@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>battviz</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+
+<div id="shell">
+
+  <aside id="rail">
+    <div class="brand">
+      <div class="name"><span class="dot"></span><h1>battviz</h1></div>
+      <span class="host" id="host">127.0.0.1</span>
+    </div>
+
+    <nav id="nav" aria-label="Views">
+      <button data-view="overview" aria-current="true">Overview</button>
+      <button data-view="culprits">Culprits <span class="count" id="n-culprits"></span></button>
+      <button data-view="timeline">Timeline <span class="count" id="n-timeline"></span></button>
+      <button data-view="wakelocks">Wakelocks <span class="count" id="n-wakelocks"></span></button>
+      <button data-view="wakeups">Wakeups <span class="count" id="n-wakeups"></span></button>
+      <button data-view="daily">Daily drain <span class="count" id="n-daily"></span></button>
+      <button data-view="raw">Raw dump</button>
+    </nav>
+
+    <div class="rail-foot">
+      <span class="src" id="source">no dump loaded</span>
+      <span id="meta"></span>
+      <button id="btn-open" type="button">Open another dump</button>
+      <input type="file" id="file" accept=".txt,.log,text/plain" hidden>
+    </div>
+  </aside>
+
+  <main>
+
+    <section class="view active" id="view-overview">
+      <header>
+        <h1>Where the power went</h1>
+        <p id="ov-intro">Loading the dump.</p>
+      </header>
+      <div class="grid m4" id="ov-metrics"></div>
+      <div class="panel">
+        <h2>Modelled power budget</h2>
+        <p class="sub">Every milliamp-hour Android attributed during the window, by subsystem.</p>
+        <div class="budget" id="ov-budget"></div>
+        <div class="legend" id="ov-budget-legend"></div>
+      </div>
+      <div class="panel">
+        <h2>Top culprits</h2>
+        <p class="sub">Ranked by a score blending modelled power, wakelock hold time, wakelock count and screen-off cpu.</p>
+        <div id="ov-top"></div>
+      </div>
+      <h2 style="margin:22px 0 10px">What stands out</h2>
+      <div id="ov-findings"></div>
+    </section>
+
+    <section class="view" id="view-culprits">
+      <header>
+        <h1>Culprits</h1>
+        <p>One row per uid. Select a row to see its processes, wakelocks, sensors and services.</p>
+      </header>
+      <div class="panel"><div id="cul-table"></div></div>
+    </section>
+
+    <section class="view" id="view-timeline">
+      <header>
+        <h1>Timeline</h1>
+        <p>Every event in the battery history, laid out on one clock. Drag to pan, scroll to zoom, hover a segment to read it.</p>
+      </header>
+      <div class="panel">
+        <div class="tl-controls">
+          <button type="button" id="tl-out">Zoom out</button>
+          <button type="button" id="tl-reset">Fit window</button>
+          <span id="tl-window"></span>
+        </div>
+        <div id="tl-scroller"><div id="tl-body" class="tl-wrap"></div></div>
+        <div class="tl-axis" id="tl-axis"></div>
+        <div id="tl-readout"><span class="faint">Hover a segment for detail.</span></div>
+      </div>
+    </section>
+
+    <section class="view" id="view-wakelocks">
+      <header>
+        <h1>Wakelocks</h1>
+        <p>App wakelocks are attributable. Kernel wakelocks are held by drivers and usually point at hardware or firmware rather than an app.</p>
+      </header>
+      <div class="panel">
+        <h2>Partial wakelocks by app</h2>
+        <p class="sub">Held time blocks suspend. A high count with a short total means repeated wakeups.</p>
+        <div id="wl-partial"></div>
+      </div>
+      <div class="panel">
+        <h2>Kernel wakelocks</h2>
+        <p class="sub">Driver-level holds, not chargeable to any app.</p>
+        <div id="wl-kernel"></div>
+      </div>
+    </section>
+
+    <section class="view" id="view-wakeups">
+      <header>
+        <h1>Wakeups</h1>
+        <p>What pulled the application processor out of suspend, and how long it stayed awake each time.</p>
+      </header>
+      <div class="panel"><div id="wu-table"></div></div>
+      <div class="panel">
+        <h2>Per-process wake time</h2>
+        <p class="sub">Aggregated from the per-pid section of the dump.</p>
+        <div id="wu-pid"></div>
+      </div>
+    </section>
+
+    <section class="view" id="view-daily">
+      <header>
+        <h1>Daily drain</h1>
+        <p>Each discharge step is one percent of battery. Duration converts to a drain rate, split by whether the screen was on.</p>
+      </header>
+      <div class="panel">
+        <h2>Drain rate by day</h2>
+        <p class="sub">Percent per hour. Lower is better.</p>
+        <div id="dl-chart"></div>
+      </div>
+      <div class="panel"><div id="dl-table"></div></div>
+    </section>
+
+    <section class="view" id="view-raw">
+      <header>
+        <h1>Raw dump</h1>
+        <p>The original text, searchable. Useful for the OEM sections battviz does not model.</p>
+      </header>
+      <div class="panel">
+        <input id="raw-search" type="search" placeholder="filter lines, e.g. wake_lock or com.google" autocomplete="off">
+        <div id="raw-count" class="faint" style="font-size:12px;margin-bottom:8px"></div>
+        <div id="raw-out"></div>
+      </div>
+    </section>
+
+  </main>
+</div>
+
+<div id="drop">Drop a batterystats dump to load it</div>
+<div id="toast" role="status" aria-live="polite"></div>
+
+<script src="/app.js"></script>
+</body>
+</html>
