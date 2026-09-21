@@ -61,6 +61,13 @@ LOG_PATTERNS = [
     (re.compile(r"\balarm\b.*\btrigger", re.I), "alarm", "Alarm fired"),
 ]
 
+# The polling command's own pieces (top, grep, the persistent shell itself)
+# run inside the same process tree being observed, so they can appear in
+# their own top sample - a genuine observer-effect artifact, not a real
+# device culprit. Excluded by name wherever process rows are parsed.
+SELF_NOISE = {"top", "grep", "head", "cat", "sh", "toybox", "dumpsys",
+             "echo", "logcat", "adb", "adbd"}
+
 
 def _now():
     return time.monotonic()
@@ -318,6 +325,17 @@ class LiveSession(object):
         self.last_top = {}
         self._overhead_warned = False
 
+        # Net accumulator: a single -n1 top sample is noisy, so an app doing
+        # real work can vanish for several ticks purely by bad luck. Ranking
+        # by accumulated cpu-time instead of the latest instantaneous reading
+        # is what makes a real background culprit visible and stable rather
+        # than flickering in and out with every poll.
+        self.proc_accum = {}
+        self.accum_start_t = None
+        self._accum_last_t = None
+        self.ACCUM_MAX_TRACKED = 500
+        self.ACCUM_PRUNE_TO = 350
+
     # ------------------------------------------------------------ startup --
 
     def start(self):
@@ -331,6 +349,7 @@ class LiveSession(object):
 
         self.running = True
         self.started_at = time.time()
+        self.accum_start_t = self.started_at
         atexit.register(self.stop)
         self.thread = threading.Thread(target=self._loop, name="battviz-live")
         self.thread.daemon = True
@@ -437,6 +456,7 @@ class LiveSession(object):
         self._parse_power(blocks.get("PWR", ""))
         wakelocks = self._parse_wakelocks(blocks.get("WL", ""))
         procs = self._parse_top(blocks.get("TOP", ""))
+        self._accumulate(procs)
 
         self._adapt_interval()
         self._check_overhead()
@@ -453,7 +473,12 @@ class LiveSession(object):
             "screen_on": self.screen_on,
             "dozing": self.dozing,
             "wakelocks": wakelocks,
-            "procs": procs,
+            # Only the instantaneous top few travel with the sample history;
+            # ranking now comes from the accumulator, and top is uncapped
+            # on-device (see the TOP command above), so storing every row in
+            # every one of up to MAX_SAMPLES history entries would grow
+            # without bound over a long session.
+            "procs": procs[:20],
             "interval": self.interval,
         }
 
@@ -557,9 +582,12 @@ class LiveSession(object):
             except ValueError:
                 continue
             name = args.strip().split()[0] if args.strip() else ""
+            base = name.rsplit("/", 1)[-1]
+            if base.lower() in SELF_NOISE:
+                continue
             procs.append({"pid": pid, "cpu": round(cpu_val, 1), "name": name})
         procs.sort(key=lambda p: -p["cpu"])
-        return procs[:10]
+        return procs
 
     # ----------------------------------------------------------- cadence --
 
@@ -587,6 +615,53 @@ class LiveSession(object):
                 "text": "duty cycle is %.0f%%, this connection is slow enough "
                         "that battviz itself is a meaningful load. Consider "
                         "wireless adb, which is typically faster." % duty})
+
+    def _accumulate(self, procs):
+        """Integrate each process's cpu% over wall time into a running total.
+
+        A process at 40% cpu held for a 2s tick contributes 0.8 cpu-seconds.
+        Summed across the session this survives the noise of any single
+        sample and reflects actual exposure rather than a snapshot.
+        """
+        now = _now()
+        delta = (now - self._accum_last_t) if self._accum_last_t else self.interval
+        delta = max(0.0, min(delta, self.interval * 3))  # clamp a stalled tick
+        self._accum_last_t = now
+        wall = time.time()
+
+        with self.lock:
+            for p in procs:
+                name = p["name"] or p["pid"]
+                cpu = p["cpu"]
+                acc = self.proc_accum.get(name)
+                if acc is None:
+                    acc = {"cpu_seconds": 0.0, "samples": 0, "peak_cpu": 0.0,
+                          "last_cpu": 0.0, "first_t": wall, "last_t": wall}
+                    self.proc_accum[name] = acc
+                acc["cpu_seconds"] += (cpu / 100.0) * delta
+                acc["samples"] += 1
+                acc["peak_cpu"] = max(acc["peak_cpu"], cpu)
+                acc["last_cpu"] = cpu
+                acc["last_t"] = wall
+
+            if len(self.proc_accum) > self.ACCUM_MAX_TRACKED:
+                keep = sorted(self.proc_accum.items(), key=lambda kv: -kv[1]["cpu_seconds"])
+                self.proc_accum = dict(keep[:self.ACCUM_PRUNE_TO])
+
+    def reset_accumulator(self):
+        """Zero the net culprit ranking without dropping the adb connection.
+
+        Distinct from stopping the session: this clears only the accumulated
+        cpu-time ranking, for isolating a specific window (after installing
+        an update, say) without paying to reconnect.
+        """
+        with self.lock:
+            self.proc_accum = {}
+        self._accum_last_t = None
+        self.accum_start_t = time.time()
+        self._push_event({"source": "session", "kind": "info",
+                          "label": "Culprit ranking reset",
+                          "text": "accumulator cleared, connection kept open"})
 
     # ------------------------------------------------------------ events --
 
@@ -682,6 +757,22 @@ class LiveSession(object):
                  "level": s["level"], "screen_on": s["screen_on"]}
                 for s in list(self.samples)[-120:]
             ]
+            accum_items = sorted(self.proc_accum.items(),
+                                 key=lambda kv: -kv[1]["cpu_seconds"])
+
+        total_cpu_s = sum(v["cpu_seconds"] for _, v in accum_items) or 1.0
+        now_wall = time.time()
+        culprits = []
+        for name, v in accum_items:
+            culprits.append({
+                "name": name,
+                "cpu_seconds": round(v["cpu_seconds"], 2),
+                "share_pct": round(100.0 * v["cpu_seconds"] / total_cpu_s, 1),
+                "last_cpu": v["last_cpu"],
+                "peak_cpu": v["peak_cpu"],
+                "samples": v["samples"],
+                "stale": (now_wall - v["last_t"]) > (self.interval * 3),
+            })
 
         return {
             "running": self.running,
@@ -690,6 +781,7 @@ class LiveSession(object):
             "device": self.device_info,
             "started_at": self.started_at,
             "uptime_s": round(time.time() - self.started_at, 1) if self.started_at else 0,
+            "accum_seconds": round(time.time() - self.accum_start_t, 1) if self.accum_start_t else 0,
             "interval": self.interval,
             "screen_on": self.screen_on,
             "dozing": self.dozing,
@@ -700,6 +792,7 @@ class LiveSession(object):
             "trend": trend,
             "samples": samples[-60:],
             "events": events[-120:],
+            "culprits": culprits,
             "drain_pct_hr": self.drain_rate(),
             "overhead": self.shell.overhead(),
             "has_deep_sync": self.deep_sync_text is not None,

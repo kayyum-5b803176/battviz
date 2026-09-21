@@ -168,6 +168,7 @@
             <span class="mono faint" id="live-mode"></span>
             <span class="mono faint" id="live-uptime" style="margin-left:auto"></span>
             <button type="button" id="live-sync">Deep sync</button>
+            <button type="button" id="live-reset">Reset ranking</button>
             <button type="button" id="live-stop">Stop session</button>
           </div>
           <div class="grid m4" id="live-metrics" style="margin-top:14px"></div>
@@ -181,7 +182,7 @@
 
         <div class="panel">
           <h2>Live culprits</h2>
-          <p class="sub">Top processes by cpu right now, plus wakelocks currently held. Select one to filter logcat to it.</p>
+          <p class="sub" id="live-top-sub">Ranked by accumulated cpu time since the session started, not a single noisy snapshot. Select one to filter logcat to it.</p>
           <div id="live-top"></div>
           <div id="live-locks" style="margin-top:14px"></div>
         </div>

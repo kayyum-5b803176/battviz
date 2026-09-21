@@ -1092,8 +1092,10 @@ function liveRender(s) {
   });
 
   liveTrace(s.trend || []);
-  liveProcs(l.procs || []);
+  liveProcs(s.culprits || []);
   liveLocks(l.wakelocks || []);
+  $("#live-top-sub").textContent = "Ranked by accumulated cpu time over " +
+    clock(s.accum_seconds * 1000) + ", not a single noisy snapshot. Select one to filter logcat to it.";
   liveEvents(s.events || []);
   liveOverhead(s.overhead || {});
 }
@@ -1157,30 +1159,46 @@ function liveTrace(trend) {
   host.appendChild(foot);
 }
 
-function liveProcs(procs) {
+function liveCpuSeconds(s) {
+  if (s < 60) return s.toFixed(1) + "s";
+  var m = Math.floor(s / 60), rem = s - m * 60;
+  return m + "m " + Math.round(rem) + "s";
+}
+
+function liveProcs(culprits) {
   var host = $("#live-top");
   host.textContent = "";
-  if (!procs.length) {
+  if (!culprits.length) {
     host.appendChild(emptyNote("No process samples yet."));
     return;
   }
-  var max = Math.max.apply(null, procs.map(function (p) { return p.cpu; }).concat([1]));
-  procs.forEach(function (p) {
-    var row = el("div", "live-proc");
-    row.setAttribute("aria-selected", String(live.focus === p.name));
-    row.appendChild(el("span", "mono", p.name || p.pid));
-    var right = el("span", "dim num");
-    right.style.marginLeft = "auto";
-    right.textContent = p.cpu.toFixed(0) + "%";
-    row.appendChild(right);
+  var max = Math.max.apply(null, culprits.map(function (c) { return c.cpu_seconds; }).concat([0.01]));
+  culprits.forEach(function (c) {
+    var row = el("div", "live-proc" + (c.stale ? " stale" : ""));
+    row.setAttribute("aria-selected", String(live.focus === c.name));
+
+    var left = el("div");
+    left.style.cssText = "display:flex;flex-direction:column;gap:1px;min-width:0";
+    left.appendChild(el("span", "name", c.name));
+    var cur = el("span", "cur", "now " + c.last_cpu.toFixed(0) + "%  ·  peak " +
+      c.peak_cpu.toFixed(0) + "%  ·  " + c.samples + " samples");
+    left.appendChild(cur);
+    row.appendChild(left);
+
+    var right = el("div");
+    right.style.cssText = "margin-left:auto;text-align:right;display:flex;flex-direction:column;gap:1px;flex:0 0 auto";
+    right.appendChild(el("span", "accum", liveCpuSeconds(c.cpu_seconds)));
     var bar = el("div", "bar");
-    bar.style.width = "72px";
+    bar.style.width = "84px";
     var seg = el("span");
-    seg.style.width = pct(p.cpu, max) + "%";
+    seg.style.width = pct(c.cpu_seconds, max) + "%";
     seg.style.background = "var(--cpu)";
     bar.appendChild(seg);
-    row.appendChild(bar);
-    row.addEventListener("click", function () { liveFocus(p.name); });
+    right.appendChild(bar);
+    row.appendChild(right);
+
+    row.style.cssText = "display:flex;align-items:center;gap:10px;cursor:pointer;border-radius:var(--radius)";
+    row.addEventListener("click", function () { liveFocus(c.name); });
     host.appendChild(row);
   });
 }
@@ -1387,6 +1405,15 @@ document.addEventListener("DOMContentLoaded", function () {
   $("#live-start").addEventListener("click", liveStart);
   $("#live-stop").addEventListener("click", liveStop);
   $("#live-refresh").addEventListener("click", liveFetchDevices);
+  $("#live-reset").addEventListener("click", function () {
+    fetch("/api/live/reset", { method: "POST" }).then(function (r) {
+      return r.json().then(function (j) { return { ok: r.ok, body: j }; });
+    }).then(function (res) {
+      if (!res.ok) { toast(res.body.error || "Could not reset."); return; }
+      toast("Culprit ranking reset");
+    });
+  });
+
   $("#live-sync").addEventListener("click", function () {
     toast("Pulling full batterystats");
     fetch("/api/live/deep-sync", { method: "POST" })

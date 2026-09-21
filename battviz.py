@@ -231,6 +231,14 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(409, {"error": "no live session"})
             return self._json(200, session.focus(body.get("package")))
 
+        if path == "/api/live/reset":
+            with _live_lock:
+                session = _live["session"]
+            if session is None:
+                return self._json(409, {"error": "no live session"})
+            session.reset_accumulator()
+            return self._json(200, {"ok": True})
+
         if path == "/api/live/deep-sync":
             with _live_lock:
                 session = _live["session"]
