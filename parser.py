@@ -7,6 +7,7 @@ makes that one section absent from the report rather than failing the parse.
 
 import re
 from collections import defaultdict
+from datetime import datetime
 
 # ---------------------------------------------------------------- duration --
 
@@ -164,7 +165,32 @@ SPAN_FLAGS = [
     "wifi_radio", "wifi_scan", "wifi_full_lock", "gps", "sensor", "camera",
     "flashlight", "phone_scanning", "plugged", "usb_data", "top", "fg",
     "package_inst", "bluetooth_scan_on", "mobile_radio", "wifi_running",
+    "tmpwhitelist",
 ]
+
+# State-value tokens (name=value, not a +/- flag) worth turning into spans
+# because their duration matters. Standard AOSP dumps carry `doze=light` /
+# `doze=deep` / `doze=off`; OEM builds vary and some (observed: OPlus/Realme)
+# carry none of this at all, in which case the resulting span list is simply
+# empty and the UI hides the lane rather than showing nothing useful.
+STATE_SPAN_NAMES = ["doze"]
+
+
+# RESET:TIME and "Start clock time" have been seen in more than one format
+# across Android versions/OEMs; each is tried in turn rather than assuming one.
+_CLOCK_FORMATS = ["%Y-%m-%d-%H-%M-%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"]
+
+
+def _parse_clock(text):
+    if not text:
+        return None
+    text = text.strip()
+    for fmt in _CLOCK_FORMATS:
+        try:
+            return datetime.strptime(text, fmt).isoformat()
+        except ValueError:
+            continue
+    return None
 
 
 def _parse_history(lines, report):
@@ -230,6 +256,9 @@ def _parse_history(lines, report):
     report["history"]["levels"] = [
         {"t": e["t"], "level": e["level"]} for e in events if e["level"] is not None
     ]
+    # start_clock is parsed later by _parse_summary; wall_clock_anchor is
+    # finalised there once both candidates are available.
+    report["history"]["wall_clock_anchor"] = _parse_clock(reset_clock)
     _build_spans(report)
 
 
@@ -251,6 +280,58 @@ def _parse_event_token(tok):
         }
     return {"type": "state", "name": name, "value": value,
             "tag": quoted, "raw": tok}
+
+
+def _covers(spans_for_lane, t):
+    return any(s["start"] <= t < (s["end"] or t) for s in spans_for_lane)
+
+
+def _derive_power_state(spans, end_t):
+    """Approximate active/idle-awake/suspended from screen+running.
+
+    This exists for dumps with no explicit doze=light/deep tokens (observed:
+    OPlus/Realme builds carry none at all). screen on is unambiguous;
+    screen off with the cpu still running approximates a light-idle state
+    (a wakelock or job is being serviced); screen off with running also off
+    approximates full suspend. This is a derived approximation, not a
+    measurement, and the UI labels it as such rather than presenting it as
+    equivalent to real doze state data.
+    """
+    screen = [s for s in spans if s["lane"] == "screen"]
+    running = [s for s in spans if s["lane"] == "running"]
+    if not screen and not running:
+        return []
+
+    bounds = {0, end_t}
+    for s in screen + running:
+        bounds.add(s["start"])
+        bounds.add(s["end"] or end_t)
+    bounds = sorted(b for b in bounds if 0 <= b <= end_t)
+
+    out = []
+    cur = None
+    for i in range(len(bounds) - 1):
+        t0, t1 = bounds[i], bounds[i + 1]
+        if t1 <= t0:
+            continue
+        mid = (t0 + t1) / 2.0
+        if _covers(screen, mid):
+            state = "active"
+        elif _covers(running, mid):
+            state = "idle_awake"
+        else:
+            state = "suspended"
+        if cur and cur["state"] == state:
+            cur["end"] = t1
+        else:
+            if cur:
+                out.append(cur)
+            cur = {"lane": "power_state", "state": state, "start": t0, "end": t1}
+    if cur:
+        out.append(cur)
+    for s in out:
+        s["duration"] = s["end"] - s["start"]
+    return out
 
 
 def _build_spans(report):
@@ -291,10 +372,40 @@ def _build_spans(report):
         cur["truncated"] = True
         spans.append(cur)
 
+    # doze (and any future STATE_SPAN_NAMES entry) arrives as name=value
+    # rather than a +/- flag, so its duration comes from tracking value
+    # changes instead of on/off pairs. "off" is the non-doze baseline and is
+    # not rendered as a segment.
+    open_state = {}
+    for ev in report["history"]["events"]:
+        if ev["kind"] != "events":
+            continue
+        for item in ev["items"]:
+            if item["type"] != "state" or item["name"] not in STATE_SPAN_NAMES:
+                continue
+            name = item["name"]
+            value = item["value"]
+            cur = open_state.get(name)
+            if cur and cur["value"] == value:
+                continue
+            if cur:
+                cur["end"] = ev["t"]
+                if cur["value"] and cur["value"] != "off":
+                    spans.append(cur)
+            open_state[name] = {"lane": name, "start": ev["t"], "end": None,
+                                "value": value, "uid": None, "tag": None}
+    for name, cur in open_state.items():
+        cur["end"] = end_t
+        cur["truncated"] = True
+        if cur["value"] and cur["value"] != "off":
+            spans.append(cur)
+
     for s in spans:
         s["duration"] = max(0, (s["end"] or 0) - s["start"])
     spans.sort(key=lambda s: s["start"])
     report["history"]["spans"] = spans
+    report["history"]["has_doze_data"] = any(s["lane"] == "doze" for s in spans)
+    report["history"]["power_state"] = _derive_power_state(spans, end_t)
 
     # Point events worth marking on the timeline.
     points = []
@@ -463,6 +574,8 @@ def _parse_summary(lines, report):
             s["screen_on_discharge_mah"] = _first_float(t)
         elif t.startswith("Start clock time:"):
             s["start_clock"] = t.split(":", 1)[1].strip()
+            if not report["history"].get("wall_clock_anchor"):
+                report["history"]["wall_clock_anchor"] = _parse_clock(s["start_clock"])
         elif t.startswith("Screen on:"):
             s["screen_on_ms"] = parse_duration(t.split(":", 1)[1].split("(")[0])
             p = _PCT.search(t)
@@ -949,6 +1062,32 @@ def _score_culprits(report):
 def _derive_findings(report):
     out = []
     s = report["summary"]
+    hist_ms = report["history"].get("duration_ms") or 0
+
+    # The detailed event log is a fixed-size ring buffer (the "X used of
+    # 4096KB" figure in the Battery History header); once full, the oldest
+    # events are silently evicted while the aggregate stats keep counting
+    # regardless, since they are a separate running total, not derived from
+    # the history log. On a device that has been up a while, this means the
+    # scrubbable timeline covers far less than "time on battery" suggests,
+    # which reads as data going missing unless it is called out explicitly.
+    if s.get("time_on_battery_ms") and hist_ms:
+        ratio = s["time_on_battery_ms"] / hist_ms if hist_ms else 0
+        if ratio >= 3 and (s["time_on_battery_ms"] - hist_ms) >= 20 * 60 * 1000:
+            out.append({
+                "level": "warn",
+                "title": "Timeline shows less than the full session",
+                "body": "The detailed event log only has room for the most "
+                        "recent %s (Android's history buffer is a fixed 4096KB "
+                        "ring buffer that overwrites its oldest entries), even "
+                        "though this device has been on battery for %s since "
+                        "its last reset. The totals on this page still cover "
+                        "the full %s; only the scrubbable Timeline is limited "
+                        "to the most recent window."
+                        % (human_duration(hist_ms), human_duration(s["time_on_battery_ms"]),
+                           human_duration(s["time_on_battery_ms"])),
+                "goto": "timeline",
+            })
 
     total_wl = sum(w["ms"] for w in report["partial_wakelocks"]) or 0
     if report["partial_wakelocks"] and total_wl:

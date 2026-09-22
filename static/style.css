@@ -272,9 +272,12 @@ td.r, th.r { text-align: right; font-variant-numeric: tabular-nums; }
 .tl-lane .seg { position: absolute; top: 0; bottom: 0; min-width: 1.5px; border-radius: 2px; }
 .tl-lane .pt { position: absolute; top: 0; bottom: 0; width: 2px; background: var(--alarm); }
 .tl-axis {
-  display: flex; justify-content: space-between; font-family: var(--mono);
-  font-size: 11px; color: var(--ink-3); padding-top: 3px;
+  position: relative; height: 16px; margin-top: 3px;
+  font-family: var(--mono); font-size: 11px; color: var(--ink-3);
 }
+.tl-axis .tick { position: absolute; top: 0; white-space: nowrap; transform: translateX(-50%); }
+.tl-axis .tick:first-child { transform: translateX(0); }
+.tl-axis .tick:last-child { transform: translateX(-100%); }
 #tl-scroller { overflow-x: hidden; cursor: crosshair; }
 
 #tl-readout {
@@ -444,3 +447,19 @@ button.danger:hover { background: var(--alarm); color: var(--paper); }
   border: 1px solid var(--alarm); border-radius: var(--radius);
   padding: 8px 10px; font-size: 13px; margin: 8px 0; color: var(--alarm);
 }
+
+.tl-mode { display: inline-flex; border: 1px solid var(--rule-2); border-radius: var(--radius); overflow: hidden; }
+.tl-mode button {
+  background: var(--paper); border: 0; border-right: 1px solid var(--rule-2);
+  color: var(--ink-2); font: inherit; font-size: 12px; padding: 4px 10px; cursor: pointer;
+}
+.tl-mode button:last-child { border-right: 0; }
+.tl-mode button[aria-current="true"] { background: var(--sunken); color: var(--ink); font-weight: 550; }
+.tl-mode button:disabled { opacity: 0.4; cursor: not-allowed; }
+
+#tl-gap-banner {
+  border: 1px solid var(--warn-rule); background: var(--warn-bg); color: var(--warn-ink);
+  border-radius: var(--radius); padding: 10px 13px; font-size: 13.5px;
+  margin-bottom: 16px;
+}
+#tl-gap-banner b { font-weight: 550; }

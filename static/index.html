@@ -73,10 +73,15 @@
         <h1>Timeline</h1>
         <p>Every event in the battery history, laid out on one clock. Drag to pan, scroll to zoom, hover a segment to read it.</p>
       </header>
+      <div id="tl-gap-banner" hidden></div>
       <div class="panel">
         <div class="tl-controls">
           <button type="button" id="tl-out">Zoom out</button>
           <button type="button" id="tl-reset">Fit window</button>
+          <span class="tl-mode" id="tl-mode-group">
+            <button type="button" id="tl-mode-elapsed" aria-current="true">Elapsed</button>
+            <button type="button" id="tl-mode-wall">Wall clock</button>
+          </span>
           <span id="tl-window"></span>
         </div>
         <div id="tl-scroller"><div id="tl-body" class="tl-wrap"></div></div>

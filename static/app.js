@@ -30,6 +30,11 @@ var CHANNEL = {
 };
 
 var LANE_COLOUR = {
+  power_state_active: "var(--screen)",
+  power_state_idle_awake: "var(--wakelock)",
+  power_state_suspended: "var(--idle)",
+  doze: "var(--radio)",
+  tmpwhitelist: "var(--radio)",
   screen: "var(--screen)",
   running: "var(--cpu)",
   wake_lock: "var(--wakelock)",
@@ -56,6 +61,9 @@ var LANE_COLOUR = {
 };
 
 var LANE_NAME = {
+  power_state: "Power state (derived)",
+  doze: "Doze",
+  tmpwhitelist: "Doze attempt",
   screen: "Screen",
   running: "CPU running",
   wake_lock: "Wakelock",
@@ -513,13 +521,44 @@ function culpritDetail(row) {
 
 /* ------------------------------------------------------------ timeline -- */
 
-var tl = { start: 0, end: 0, full: 0, drag: null };
+var tl = { start: 0, end: 0, full: 0, drag: null, wallClock: false };
+
+function tlAnchor() {
+  var iso = report.history && report.history.wall_clock_anchor;
+  return iso ? new Date(iso) : null;
+}
+
+// Elapsed-ms since capture start -> a wall-clock HH:MM:SS string, using the
+// anchor parsed from RESET:TIME or Start clock time. Falls back to elapsed
+// formatting if no anchor was parseable, so callers never need to branch.
+function tlTime(ms) {
+  if (!tl.wallClock) return clock(ms);
+  var anchor = tlAnchor();
+  if (!anchor) return clock(ms);
+  var d = new Date(anchor.getTime() + ms);
+  var pad = function (n) { return (n < 10 ? "0" : "") + n; };
+  return pad(d.getHours()) + ":" + pad(d.getMinutes()) + ":" + pad(d.getSeconds());
+}
 
 function renderTimeline() {
   var h = report.history || {};
   tl.full = h.duration_ms || 0;
   tl.start = 0;
   tl.end = tl.full;
+  tl.wallClock = false;
+
+  var s = report.summary || {};
+  var banner = $("#tl-gap-banner");
+  var totalMs = s.time_on_battery_ms || 0;
+  if (totalMs && tl.full && totalMs - tl.full >= 20 * 60 * 1000 && totalMs / tl.full >= 3) {
+    banner.hidden = false;
+    banner.innerHTML = "<b>This covers " + dur(tl.full) + " of " + dur(totalMs) + " on battery.</b> " +
+      "Android's history log is a fixed-size buffer that overwrites its oldest events, so only the " +
+      "most recent window is scrubbable here even though the totals elsewhere on this page span the full session.";
+  } else {
+    banner.hidden = true;
+  }
+
   drawTimeline();
 
   var scroller = $("#tl-scroller");
@@ -562,6 +601,69 @@ function renderTimeline() {
   $("#tl-reset").onclick = function () {
     tl.start = 0; tl.end = tl.full; drawTimeline();
   };
+
+  var hasAnchor = !!(h.wall_clock_anchor);
+  var wallBtn = $("#tl-mode-wall");
+  wallBtn.disabled = !hasAnchor;
+  wallBtn.title = hasAnchor ? "" : "No parseable start time in this dump";
+  $("#tl-mode-elapsed").onclick = function () {
+    tl.wallClock = false;
+    $("#tl-mode-elapsed").setAttribute("aria-current", "true");
+    wallBtn.setAttribute("aria-current", "false");
+    drawTimeline();
+  };
+  wallBtn.onclick = function () {
+    if (wallBtn.disabled) return;
+    tl.wallClock = true;
+    wallBtn.setAttribute("aria-current", "true");
+    $("#tl-mode-elapsed").setAttribute("aria-current", "false");
+    drawTimeline();
+  };
+}
+
+// Candidate tick spacings, in ms, chosen to look like a real clock rather
+// than arbitrary fractions of whatever window happens to be visible.
+var NICE_INTERVALS = [
+  1000, 2000, 5000, 10000, 15000, 30000,
+  60000, 2 * 60000, 5 * 60000, 10 * 60000, 15 * 60000, 30 * 60000,
+  3600000, 2 * 3600000, 3 * 3600000, 6 * 3600000, 12 * 3600000
+];
+
+function niceInterval(spanMs) {
+  var target = spanMs / 5;
+  for (var i = 0; i < NICE_INTERVALS.length; i++) {
+    if (NICE_INTERVALS[i] >= target) return NICE_INTERVALS[i];
+  }
+  return NICE_INTERVALS[NICE_INTERVALS.length - 1];
+}
+
+// Tick positions, elapsed ms from capture start, each a round number on
+// whichever clock is showing: multiples of the interval from t=0 for
+// elapsed mode, or from the real epoch for wall-clock mode, so the tick
+// labels read 18:05 / 18:10 rather than 18:11:37 / 18:23:13.
+function tlTicks() {
+  var span = tl.end - tl.start;
+  var step = niceInterval(span);
+  var first;
+  if (tl.wallClock) {
+    var anchor = tlAnchor();
+    if (anchor) {
+      // Align in real epoch space, then convert back to elapsed ms - folding
+      // the anchor offset through ceil() on a negated value instead gives
+      // the wrong boundary because ceil() is not symmetric around zero.
+      var wallStart = anchor.getTime() + tl.start;
+      first = Math.ceil(wallStart / step) * step - anchor.getTime();
+    } else {
+      first = Math.ceil(tl.start / step) * step;
+    }
+  } else {
+    first = Math.ceil(tl.start / step) * step;
+  }
+  var ticks = [];
+  for (var t = first; t <= tl.end + 1 && ticks.length < 14; t += step) {
+    if (t >= tl.start) ticks.push(t);
+  }
+  return ticks;
 }
 
 function drawTimeline() {
@@ -571,17 +673,46 @@ function drawTimeline() {
   var points = (report.history && report.history.points) || [];
   var span = Math.max(1, tl.end - tl.start);
 
-  $("#tl-window").textContent = clock(tl.start) + " to " + clock(tl.end) +
+  $("#tl-window").textContent = tlTime(tl.start) + " to " + tlTime(tl.end) +
     "  (" + dur(span) + " of " + dur(tl.full) + ")";
+
+  // The derived power-state lane comes first: it is the closest thing to a
+  // single answer to "what mode was the device in", built from screen+running
+  // for dumps with no explicit doze=light/deep tokens (see parser.py). It is
+  // rendered separately from the flag-based lanes below because its segments
+  // key on `state`, not a lane name, and it is always labelled as derived.
+  var powerState = (report.history && report.history.power_state) || [];
+  if (powerState.length) {
+    var pslabel = el("div", "tl-label", LANE_NAME.power_state);
+    pslabel.title = "Approximated from screen + cpu-running signals, not a measured doze state";
+    body.appendChild(pslabel);
+    var pstrack = el("div", "tl-lane");
+    powerState.forEach(function (s) {
+      if (s.end < tl.start || s.start > tl.end) return;
+      var seg = el("div", "seg");
+      var left = pct(s.start - tl.start, span);
+      var width = pct(Math.max(s.end - s.start, span * 0.0012), span);
+      seg.style.left = left + "%";
+      seg.style.width = Math.min(width, 100 - left) + "%";
+      seg.style.background = LANE_COLOUR["power_state_" + s.state] || "var(--idle)";
+      seg.dataset.info = JSON.stringify({
+        lane: "power_state", start: s.start, end: s.end,
+        tag: s.state.replace("_", " "), duration: s.duration
+      });
+      pstrack.appendChild(seg);
+    });
+    body.appendChild(pstrack);
+  }
 
   var byLane = {};
   spans.forEach(function (s) {
     (byLane[s.lane] = byLane[s.lane] || []).push(s);
   });
 
-  var order = ["screen", "top", "running", "wake_lock", "job", "sync", "audio",
-    "wifi_radio", "wifi_scan", "mobile_radio", "phone_scanning", "gps",
-    "sensor", "camera", "flashlight", "plugged", "usb_data"];
+  var order = ["screen", "doze", "tmpwhitelist", "top", "running", "wake_lock",
+    "job", "sync", "audio", "wifi_radio", "wifi_scan", "mobile_radio",
+    "phone_scanning", "gps", "sensor", "camera", "flashlight", "plugged",
+    "usb_data"];
   var lanes = order.filter(function (k) { return byLane[k]; })
     .concat(Object.keys(byLane).filter(function (k) { return order.indexOf(k) < 0; }));
 
@@ -630,9 +761,11 @@ function drawTimeline() {
 
   var axis = $("#tl-axis");
   axis.textContent = "";
-  for (var i = 0; i <= 4; i++) {
-    axis.appendChild(el("span", null, clock(tl.start + (span * i) / 4)));
-  }
+  tlTicks().forEach(function (t) {
+    var tick = el("span", "tick", tlTime(t));
+    tick.style.left = pct(t - tl.start, span) + "%";
+    axis.appendChild(tick);
+  });
 
   body.onmousemove = function (e) {
     var t = e.target;
@@ -644,8 +777,8 @@ function drawTimeline() {
 function showReadout(info) {
   var box = $("#tl-readout");
   box.textContent = "";
-  var t = el("div", "t", clock(info.start) +
-    (info.end > info.start ? " \u2192 " + clock(info.end) + "   (" + dur(info.end - info.start) + ")" : ""));
+  var t = el("div", "t", tlTime(info.start) +
+    (info.end > info.start ? " \u2192 " + tlTime(info.end) + "   (" + dur(info.end - info.start) + ")" : ""));
   box.appendChild(t);
   var title = el("div");
   title.style.fontWeight = "550";
@@ -662,6 +795,12 @@ function showReadout(info) {
     sub.style.fontSize = "13px";
     sub.textContent = parts.join("  \u00b7  ");
     box.appendChild(sub);
+  }
+  if (info.lane === "power_state") {
+    var note = el("div", "faint");
+    note.style.cssText = "font-size:11.5px;margin-top:2px";
+    note.textContent = "Derived from screen + cpu-running signals, not a measured doze state.";
+    box.appendChild(note);
   }
 }
 
