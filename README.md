@@ -88,6 +88,50 @@ Drain rate stays at "measuring" until there is a real window to measure: at
 least two percent of drop across at least five minutes. One percent over
 twenty seconds extrapolates to a confident and meaningless number.
 
+## Control mode
+
+`Control` ranks apps by what a Perfetto trace actually recorded and lets you
+act on the result. This is the difference between live mode's sampled `top`
+readings and a real answer: a trace records the kernel's own scheduler
+events, so the ranking is a measurement, not a periodic guess. It needs a
+live session started first, so battviz knows which device to trace.
+
+Analysis needs the `perfetto` Python package:
+
+```sh
+pip install perfetto --break-system-packages
+```
+
+That's the whole setup - no binary to download, nothing to `chmod`, nothing
+to put on `PATH`. Trace files are parsed directly against the protobuf
+schema the package ships, rather than shelling out to Google's separate
+`trace_processor_shell` tool.
+
+Two things that show up in a raw trace are excluded from the ranking
+automatically, for the same reason `live.py` excludes `top` measuring
+itself: the per-core idle thread (`swapper/N`), and Perfetto's own capture
+daemon (`traced_probes`), which is only busy because it is the one recording
+the trace. If a live session is running during a capture, its own polling
+commands (`top`, `grep`, `sh`) are excluded too, since a capture requires
+that session to still be connected to the device.
+
+### Acting on the ranking
+
+Select apps and choose an action:
+
+- **Force stop** - kills the app now. Restarts on next launch, always safe.
+- **Restrict background** - throttles jobs, alarms and network without
+  removing the app. The middle option.
+- **Disable** - stops the app from running until re-enabled. Reversible
+  (`pm enable`), but the strongest of the three.
+
+Every action shows the exact `adb shell` command and its plain-English
+effect before anything runs, with a **Copy commands** option if you'd rather
+run it yourself than let battviz execute it. System packages are blocked
+from Disable by default, and a fixed denylist (`system_server`,
+`com.android.systemui`, `com.android.settings` and similar) is refused
+outright, since disabling them can leave the device unusable.
+
 ## The views
 
 **Overview** — time on battery, screen-on share, idle share and drain, then the
@@ -137,6 +181,8 @@ OPlus/MediaTek dump with all ten sections present.
 battviz.py          CLI and HTTP server
 parser.py           dump parser and culprit scoring
 live.py             live adb session, polling and logcat
+trace.py            perfetto capture and trace analysis
+control.py          package control actions (force-stop, restrict, disable)
 static/index.html   page shell
 static/style.css    palette and layout
 static/app.js       views, charts, timeline interaction

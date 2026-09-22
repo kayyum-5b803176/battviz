@@ -1297,7 +1297,7 @@ var ctl = { rows: [], selected: {}, source: "none", pkgInfo: {}, pending: null }
 function ctlRefreshState() {
   fetch("/api/trace/state").then(function (r) { return r.json(); }).then(function (s) {
     $("#ctl-tp").textContent = s.trace_processor
-      ? "trace_processor found" : "trace_processor not installed";
+      ? "trace analysis ready" : "run: pip install perfetto --break-system-packages";
     if (s.analysis && s.analysis.culprits) {
       ctl.source = "trace";
       ctl.rows = s.analysis.culprits.map(function (c) {
