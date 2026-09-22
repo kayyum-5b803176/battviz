@@ -30,6 +30,8 @@ except ImportError:
 
 import parser as bsparser
 import live as livemod
+import control as controlmod
+import trace as tracemod
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 # Accept either layout: a proper static/ subfolder, or the static files
@@ -56,6 +58,11 @@ _state_lock = threading.Lock()
 # second would double the device-side cost for no extra information.
 _live = {"session": None}
 _live_lock = threading.Lock()
+
+# Last trace capture/analysis, and the package index for the live device.
+_trace = {"capture": None, "analysis": None, "busy": False}
+_trace_lock = threading.Lock()
+_pkg_index = {"index": None}
 
 MAX_UPLOAD = 64 * 1024 * 1024
 
@@ -172,6 +179,32 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError:
                 since = 0
             return self._json(200, session.snapshot(since))
+        if path == "/api/trace/state":
+            with _trace_lock:
+                return self._json(200, {
+                    "busy": _trace["busy"],
+                    "capture": _trace["capture"],
+                    "analysis": _trace["analysis"],
+                    "trace_processor": tracemod.find_trace_processor(),
+                })
+        if path == "/api/control/packages":
+            with _live_lock:
+                session = _live["session"]
+            if session is None:
+                return self._json(409, {"error": "no live session"})
+            index = _pkg_index.get("index")
+            if index is None:
+                index = controlmod.PackageIndex(session.shell)
+                _pkg_index["index"] = index
+            try:
+                index.refresh()
+            except Exception as exc:  # noqa: BLE001
+                return self._json(502, {"error": "could not list packages: %s" % exc})
+            return self._json(200, {
+                "system": sorted(index.system),
+                "third_party": sorted(index.third_party),
+                "disabled": sorted(index.disabled),
+            })
         if path == "/api/adb":
             try:
                 text = pull_via_adb()
@@ -230,6 +263,81 @@ class Handler(BaseHTTPRequestHandler):
             if session is None:
                 return self._json(409, {"error": "no live session"})
             return self._json(200, session.focus(body.get("package")))
+
+        if path == "/api/trace/capture":
+            body = self._read_json_body()
+            with _live_lock:
+                session = _live["session"]
+            if session is None:
+                return self._json(409, {"error": "start a live session first, "
+                                                 "so battviz knows which device to trace"})
+            with _trace_lock:
+                if _trace["busy"]:
+                    return self._json(409, {"error": "a capture is already running"})
+                _trace["busy"] = True
+            try:
+                cap = tracemod.capture(session.shell, session.serial,
+                                       duration_s=int(body.get("duration", 30) or 30))
+            except tracemod.TraceError as exc:
+                with _trace_lock:
+                    _trace["busy"] = False
+                return self._json(502, {"error": str(exc)})
+            except Exception as exc:  # noqa: BLE001
+                with _trace_lock:
+                    _trace["busy"] = False
+                return self._json(500, {"error": "capture failed: %s" % exc})
+
+            analysis, analysis_error = None, None
+            try:
+                analysis = tracemod.analyse(cap["path"])
+            except tracemod.TraceError as exc:
+                analysis_error = str(exc)
+
+            with _trace_lock:
+                _trace["capture"] = cap
+                _trace["analysis"] = analysis
+                _trace["busy"] = False
+            return self._json(200, {"ok": True, "capture": cap,
+                                    "analysis": analysis,
+                                    "analysis_error": analysis_error})
+
+        if path == "/api/control/plan":
+            body = self._read_json_body()
+            with _live_lock:
+                session = _live["session"]
+            index = _pkg_index.get("index")
+            if index is None and session is not None:
+                index = controlmod.PackageIndex(session.shell)
+                _pkg_index["index"] = index
+            try:
+                return self._json(200, controlmod.plan(
+                    body.get("package"), body.get("action"), index=index))
+            except controlmod.ControlError as exc:
+                return self._json(400, {"error": str(exc)})
+
+        if path == "/api/control/apply":
+            body = self._read_json_body()
+            with _live_lock:
+                session = _live["session"]
+            if session is None:
+                return self._json(409, {"error": "no live session, so there is "
+                                                 "no device to act on"})
+            index = _pkg_index.get("index")
+            if index is None:
+                index = controlmod.PackageIndex(session.shell)
+                _pkg_index["index"] = index
+            try:
+                result = controlmod.apply(session.shell, body.get("package"),
+                                          body.get("action"), index=index)
+            except controlmod.ControlError as exc:
+                return self._json(400, {"error": str(exc)})
+            except Exception as exc:  # noqa: BLE001
+                return self._json(500, {"error": "action failed: %s" % exc})
+            session._push_event({
+                "source": "control", "kind": "info",
+                "label": result["label"] + (" ok" if result["ok"] else " failed"),
+                "text": result["command"]})
+            return self._json(200, result)
 
         if path == "/api/live/reset":
             with _live_lock:

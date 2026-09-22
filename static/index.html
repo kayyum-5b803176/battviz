@@ -26,6 +26,7 @@
       <button data-view="daily">Daily drain <span class="count" id="n-daily"></span></button>
       <button data-view="raw">Raw dump</button>
       <button data-view="live">Live <span class="count" id="n-live"></span></button>
+      <button data-view="control">Control <span class="count" id="n-control"></span></button>
     </nav>
 
     <div class="rail-foot">
@@ -201,7 +202,65 @@
       </div>
     </section>
 
+    <section class="view" id="view-control">
+      <header>
+        <h1>Analyse and control</h1>
+        <p>Rank apps by what the kernel actually recorded, then act on them. A Perfetto capture measures real scheduled cpu time and wakeups rather than sampling, so the ranking is evidence instead of an estimate.</p>
+      </header>
+
+      <div class="panel">
+        <div class="live-head">
+          <span style="font-size:14px;font-weight:550">Trace capture</span>
+          <span class="mono faint" id="ctl-tp"></span>
+          <span style="margin-left:auto"></span>
+          <label class="live-opt">Duration
+            <select id="ctl-duration" style="margin-left:6px">
+              <option value="15">15s</option>
+              <option value="30" selected>30s</option>
+              <option value="60">60s</option>
+              <option value="120">2m</option>
+            </select>
+          </label>
+          <button type="button" id="ctl-capture" class="primary">Capture trace</button>
+        </div>
+        <div id="ctl-capture-status" class="empty">Start a live session first, then capture. Use the phone normally during the capture so there is something to see.</div>
+      </div>
+
+      <div class="panel">
+        <div class="live-head">
+          <span style="font-size:14px;font-weight:550">Ranked culprits</span>
+          <span class="faint" id="ctl-source" style="font-size:12px"></span>
+          <span style="margin-left:auto"></span>
+          <label class="live-opt"><input type="checkbox" id="ctl-hide-system" checked> Hide system packages</label>
+        </div>
+        <div id="ctl-list" style="margin-top:12px"></div>
+      </div>
+
+      <div class="panel" id="ctl-actionbar" hidden>
+        <div class="live-head">
+          <span id="ctl-selcount" style="font-size:13px"></span>
+          <span style="margin-left:auto"></span>
+          <button type="button" data-act="force-stop">Force stop</button>
+          <button type="button" data-act="restrict">Restrict background</button>
+          <button type="button" data-act="disable" class="danger">Disable</button>
+          <button type="button" data-act="enable">Enable</button>
+        </div>
+      </div>
+    </section>
+
   </main>
+</div>
+
+<div id="ctl-modal" class="modal" hidden>
+  <div class="modal-box">
+    <h3 id="ctl-modal-title">Confirm</h3>
+    <div id="ctl-modal-body"></div>
+    <div class="modal-actions">
+      <button type="button" id="ctl-modal-cancel">Cancel</button>
+      <button type="button" id="ctl-modal-copy">Copy commands</button>
+      <button type="button" id="ctl-modal-run" class="danger">Run on device</button>
+    </div>
+  </div>
 </div>
 
 <div id="drop">Drop a batterystats dump to load it</div>

@@ -1285,6 +1285,260 @@ function renderLive() {
   liveFetchDevices();
 }
 
+
+/* ------------------------------------------------------------- control -- */
+
+/* Ranking prefers real trace measurements when a capture exists, and falls
+   back to the live accumulator otherwise. The source is always labelled, so
+   it is clear whether a number is measured or sampled. */
+
+var ctl = { rows: [], selected: {}, source: "none", pkgInfo: {}, pending: null };
+
+function ctlRefreshState() {
+  fetch("/api/trace/state").then(function (r) { return r.json(); }).then(function (s) {
+    $("#ctl-tp").textContent = s.trace_processor
+      ? "trace_processor found" : "trace_processor not installed";
+    if (s.analysis && s.analysis.culprits) {
+      ctl.source = "trace";
+      ctl.rows = s.analysis.culprits.map(function (c) {
+        return { name: c.name, cpu: c.cpu_ms, wakeups: c.wakeups,
+                 threads: c.threads, isPkg: c.is_package, unit: "ms cpu" };
+      });
+      $("#ctl-source").textContent = "measured from a " +
+        (s.capture ? s.capture.duration_s + "s" : "") + " perfetto trace";
+    }
+    ctlRender();
+  }).catch(function () {});
+}
+
+function ctlLoadFallback() {
+  fetch("/api/live/state?since=0").then(function (r) { return r.json(); })
+    .then(function (s) {
+      if (ctl.source === "trace") return;
+      if (!s.running || !s.culprits) return;
+      ctl.source = "live";
+      ctl.rows = s.culprits.map(function (c) {
+        return { name: c.name, cpu: c.cpu_seconds * 1000, wakeups: null,
+                 isPkg: /^[a-z][\w]*(\.[\w]+){2,}$/.test(c.name), unit: "ms cpu" };
+      });
+      $("#ctl-source").textContent = "sampled from the live session, capture a trace for measured data";
+      ctlRender();
+    }).catch(function () {});
+}
+
+function ctlLoadPackages() {
+  fetch("/api/control/packages").then(function (r) {
+    if (!r.ok) return null;
+    return r.json();
+  }).then(function (p) {
+    if (!p) return;
+    ctl.pkgInfo = {};
+    (p.system || []).forEach(function (n) { ctl.pkgInfo[n] = { system: true }; });
+    (p.third_party || []).forEach(function (n) { ctl.pkgInfo[n] = { system: false }; });
+    (p.disabled || []).forEach(function (n) {
+      ctl.pkgInfo[n] = ctl.pkgInfo[n] || {};
+      ctl.pkgInfo[n].disabled = true;
+    });
+    ctlRender();
+  }).catch(function () {});
+}
+
+function ctlRender() {
+  var host = $("#ctl-list");
+  host.textContent = "";
+  var hideSystem = $("#ctl-hide-system").checked;
+
+  var rows = ctl.rows.filter(function (r) {
+    if (!r.isPkg) return false;
+    var info = ctl.pkgInfo[r.name];
+    if (hideSystem && info && info.system) return false;
+    return true;
+  });
+
+  if (!rows.length) {
+    host.appendChild(emptyNote(ctl.rows.length
+      ? "No user packages in the ranking. Uncheck hide system packages to see everything."
+      : "Nothing ranked yet. Start a live session, or capture a trace for measured data."));
+    ctlUpdateBar();
+    return;
+  }
+
+  var max = Math.max.apply(null, rows.map(function (r) { return r.cpu || 0; }).concat([1]));
+  rows.forEach(function (r) {
+    var info = ctl.pkgInfo[r.name] || {};
+    var row = el("div", "ctl-row");
+
+    var cb = document.createElement("input");
+    cb.type = "checkbox";
+    cb.checked = !!ctl.selected[r.name];
+    cb.addEventListener("change", function () {
+      if (cb.checked) ctl.selected[r.name] = true;
+      else delete ctl.selected[r.name];
+      ctlUpdateBar();
+    });
+    row.appendChild(cb);
+
+    var name = el("span", "pkg-name", r.name);
+    name.style.flex = "1";
+    row.appendChild(name);
+
+    if (r.cpu != null) {
+      row.appendChild(el("span", "metric-s", (r.cpu >= 1000
+        ? (r.cpu / 1000).toFixed(1) + "s" : Math.round(r.cpu) + "ms") + " cpu"));
+    }
+    if (r.wakeups != null) {
+      row.appendChild(el("span", "metric-s", r.wakeups + " wakeups"));
+    }
+
+    var bar = el("div", "bar");
+    bar.style.width = "70px";
+    var seg = el("span");
+    seg.style.width = pct(r.cpu || 0, max) + "%";
+    seg.style.background = "var(--cpu)";
+    bar.appendChild(seg);
+    row.appendChild(bar);
+
+    if (info.disabled) row.appendChild(el("span", "ctl-tag off", "disabled"));
+    else if (info.system) row.appendChild(el("span", "ctl-tag sys", "system"));
+    else if (info.system === false) row.appendChild(el("span", "ctl-tag", "user app"));
+
+    host.appendChild(row);
+  });
+  ctlUpdateBar();
+}
+
+function ctlUpdateBar() {
+  var names = Object.keys(ctl.selected);
+  $("#ctl-actionbar").hidden = names.length === 0;
+  $("#ctl-selcount").textContent = names.length + " selected";
+}
+
+function ctlPlanAll(action) {
+  var names = Object.keys(ctl.selected);
+  if (!names.length) return;
+  Promise.all(names.map(function (pkg) {
+    return fetch("/api/control/plan", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ package: pkg, action: action })
+    }).then(function (r) { return r.json().then(function (j) {
+      return r.ok ? j : { package: pkg, action: action, blocked: j.error }; }); });
+  })).then(function (plans) { ctlShowModal(action, plans); });
+}
+
+function ctlShowModal(action, plans) {
+  ctl.pending = { action: action, plans: plans };
+  var runnable = plans.filter(function (p) { return !p.blocked; });
+  var blocked = plans.filter(function (p) { return p.blocked; });
+
+  $("#ctl-modal-title").textContent = (plans[0] && plans[0].label ? plans[0].label : action)
+    + " " + runnable.length + (runnable.length === 1 ? " app" : " apps");
+
+  var body = $("#ctl-modal-body");
+  body.textContent = "";
+
+  if (runnable.length) {
+    body.appendChild(el("p", "dim", runnable[0].effect));
+    var cmds = el("div", "cmd-block");
+    cmds.textContent = runnable.map(function (p) { return p.command; }).join("\n");
+    cmds.style.whiteSpace = "pre-wrap";
+    body.appendChild(cmds);
+
+    runnable.forEach(function (p) {
+      if (p.warning) {
+        var w = el("div", "ctl-warn");
+        w.textContent = p.package + ": " + p.warning;
+        body.appendChild(w);
+      }
+    });
+
+    if (runnable[0].undo_command) {
+      var undo = el("p", "faint");
+      undo.style.fontSize = "12.5px";
+      undo.textContent = "Reversible: " + runnable[0].undo_label.toLowerCase() +
+        " with " + runnable[0].undo_command.replace(runnable[0].package, "<package>");
+      body.appendChild(undo);
+    }
+  }
+
+  blocked.forEach(function (p) {
+    var b = el("div", "ctl-block");
+    b.textContent = p.blocked;
+    body.appendChild(b);
+  });
+
+  $("#ctl-modal-run").disabled = runnable.length === 0;
+  $("#ctl-modal-run").textContent = "Run on device";
+  $("#ctl-modal").hidden = false;
+}
+
+function ctlRunPending() {
+  if (!ctl.pending) return;
+  var runnable = ctl.pending.plans.filter(function (p) { return !p.blocked; });
+  var action = ctl.pending.action;
+  $("#ctl-modal-run").disabled = true;
+  $("#ctl-modal-run").textContent = "Running";
+
+  var done = 0, failed = 0;
+  Promise.all(runnable.map(function (p) {
+    return fetch("/api/control/apply", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ package: p.package, action: action })
+    }).then(function (r) { return r.json().then(function (j) {
+      if (r.ok && j.ok) done++; else failed++; }); })
+      .catch(function () { failed++; });
+  })).then(function () {
+    $("#ctl-modal").hidden = true;
+    ctl.pending = null;
+    ctl.selected = {};
+    toast(done + " applied" + (failed ? ", " + failed + " failed" : ""));
+    ctlLoadPackages();
+  });
+}
+
+function ctlCapture() {
+  var btn = $("#ctl-capture");
+  var dur = parseInt($("#ctl-duration").value, 10) || 30;
+  btn.disabled = true;
+  btn.textContent = "Capturing " + dur + "s";
+  var status = $("#ctl-capture-status");
+  status.className = "";
+  status.textContent = "Recording. Use the phone normally so the trace has something in it.";
+
+  fetch("/api/trace/capture", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ duration: dur })
+  }).then(function (r) { return r.json().then(function (j) {
+    return { ok: r.ok, body: j }; }); })
+    .then(function (res) {
+      btn.disabled = false;
+      btn.textContent = "Capture trace";
+      if (!res.ok) { status.className = "empty"; status.textContent = res.body.error; return; }
+      var cap = res.body.capture || {};
+      var msg = "Captured " + Math.round((cap.bytes || 0) / 1024) + " KB over " +
+        cap.duration_s + "s.";
+      if (res.body.analysis_error) {
+        msg += " Analysis unavailable: " + res.body.analysis_error;
+        status.className = "empty";
+      } else {
+        msg += " Trace kept at " + cap.path;
+        status.className = "";
+      }
+      status.textContent = msg;
+      ctlRefreshState();
+    }).catch(function (e) {
+      btn.disabled = false;
+      btn.textContent = "Capture trace";
+      status.className = "empty";
+      status.textContent = "Capture failed: " + e;
+    });
+}
+
+function renderControl() {
+  ctlRefreshState();
+  ctlLoadFallback();
+  ctlLoadPackages();
+}
+
 /* -------------------------------------------------------------- routing -- */
 
 var RENDERED = {};
@@ -1296,7 +1550,8 @@ var RENDERERS = {
   wakeups: renderWakeups,
   daily: renderDaily,
   raw: renderRaw,
-  live: renderLive
+  live: renderLive,
+  control: renderControl
 };
 
 function show(view) {
@@ -1308,6 +1563,8 @@ function show(view) {
   });
   if (view === "live") {
     if (!RENDERED.live) { renderLive(); RENDERED.live = true; }
+  } else if (view === "control") {
+    renderControl();
   } else if (report && RENDERERS[view] && !RENDERED[view]) {
     RENDERERS[view]();
     RENDERED[view] = true;
@@ -1405,6 +1662,23 @@ document.addEventListener("DOMContentLoaded", function () {
   $("#live-start").addEventListener("click", liveStart);
   $("#live-stop").addEventListener("click", liveStop);
   $("#live-refresh").addEventListener("click", liveFetchDevices);
+  $("#ctl-capture").addEventListener("click", ctlCapture);
+  $("#ctl-hide-system").addEventListener("change", ctlRender);
+  document.querySelectorAll("#ctl-actionbar button[data-act]").forEach(function (b) {
+    b.addEventListener("click", function () { ctlPlanAll(b.dataset.act); });
+  });
+  $("#ctl-modal-cancel").addEventListener("click", function () {
+    $("#ctl-modal").hidden = true; ctl.pending = null;
+  });
+  $("#ctl-modal-run").addEventListener("click", ctlRunPending);
+  $("#ctl-modal-copy").addEventListener("click", function () {
+    if (!ctl.pending) return;
+    var text = ctl.pending.plans.filter(function (p) { return !p.blocked; })
+      .map(function (p) { return "adb shell " + p.command; }).join("\n");
+    if (navigator.clipboard) navigator.clipboard.writeText(text);
+    toast("Commands copied, run them yourself");
+  });
+
   $("#live-reset").addEventListener("click", function () {
     fetch("/api/live/reset", { method: "POST" }).then(function (r) {
       return r.json().then(function (j) { return { ok: r.ok, body: j }; });
