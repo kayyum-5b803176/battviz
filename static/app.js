@@ -1431,7 +1431,8 @@ function renderLive() {
    back to the live accumulator otherwise. The source is always labelled, so
    it is clear whether a number is measured or sampled. */
 
-var ctl = { rows: [], selected: {}, source: "none", pkgInfo: {}, pending: null };
+var ctl = { rows: [], selected: {}, source: "none", pkgInfo: {}, pending: null,
+            net: {}, signals: {}, showNet: false };
 
 function ctlRefreshState() {
   fetch("/api/trace/state").then(function (r) { return r.json(); }).then(function (s) {
@@ -1465,6 +1466,32 @@ function ctlLoadFallback() {
     }).catch(function () {});
 }
 
+function ctlBytes(n) {
+  if (!n) return "0";
+  if (n >= 1073741824) return (n / 1073741824).toFixed(2) + " GB";
+  if (n >= 1048576) return (n / 1048576).toFixed(1) + " MB";
+  if (n >= 1024) return (n / 1024).toFixed(0) + " KB";
+  return n + " B";
+}
+
+/* Network bytes are a separate signal from cpu time, not a component of it:
+   an app can be near-invisible to a cpu ranking while steadily sending data.
+   Shown as its own column rather than folded into the score. */
+function ctlLoadNetwork() {
+  fetch("/api/control/network").then(function (r) {
+    if (!r.ok) return null;
+    return r.json();
+  }).then(function (j) {
+    if (!j) return;
+    ctl.net = {};
+    (j.rows || []).forEach(function (row) {
+      ctl.net[row.package] = row;
+    });
+    ctl.showNet = true;
+    ctlRender();
+  }).catch(function () {});
+}
+
 function ctlLoadPackages() {
   fetch("/api/control/packages").then(function (r) {
     if (!r.ok) return null;
@@ -1487,11 +1514,39 @@ function ctlRender() {
   host.textContent = "";
   var hideSystem = $("#ctl-hide-system").checked;
 
-  var rows = ctl.rows.filter(function (r) {
+  // The cpu ranking cannot see an app that transfers data without burning
+  // cpu - exactly the case worth catching. Any package with network traffic
+  // is merged in, so it appears with a real network figure and a zero cpu
+  // figure rather than being absent entirely.
+  var merged = ctl.rows.slice();
+  var seen = {};
+  merged.forEach(function (r) { seen[r.name] = true; });
+  if (ctl.showNet) {
+    Object.keys(ctl.net).forEach(function (pkg) {
+      if (seen[pkg] || !ctl.net[pkg].total) return;
+      if (!/^[a-z][\w]*(\.[\w]+){2,}$/.test(pkg)) return;
+      merged.push({ name: pkg, cpu: 0, wakeups: null, isPkg: true, netOnly: true });
+    });
+  }
+
+  var rows = merged.filter(function (r) {
     if (!r.isPkg) return false;
     var info = ctl.pkgInfo[r.name];
     if (hideSystem && info && info.system) return false;
     return true;
+  });
+
+  // Sort by whichever signal is larger relative to its own column max, so a
+  // network-only entry is not stranded at the bottom by a zero cpu figure.
+  var maxCpu = Math.max.apply(null, rows.map(function (r) { return r.cpu || 0; }).concat([1]));
+  var maxNet = Math.max.apply(null, rows.map(function (r) {
+    var n = ctl.net[r.name]; return n ? n.total : 0;
+  }).concat([1]));
+  rows.sort(function (a, b) {
+    var an = ctl.net[a.name], bn = ctl.net[b.name];
+    var as = Math.max((a.cpu || 0) / maxCpu, (an ? an.total : 0) / maxNet);
+    var bs = Math.max((b.cpu || 0) / maxCpu, (bn ? bn.total : 0) / maxNet);
+    return bs - as;
   });
 
   if (!rows.length) {
@@ -1502,7 +1557,7 @@ function ctlRender() {
     return;
   }
 
-  var max = Math.max.apply(null, rows.map(function (r) { return r.cpu || 0; }).concat([1]));
+  var max = maxCpu;
   rows.forEach(function (r) {
     var info = ctl.pkgInfo[r.name] || {};
     var row = el("div", "ctl-row");
@@ -1527,6 +1582,16 @@ function ctlRender() {
     }
     if (r.wakeups != null) {
       row.appendChild(el("span", "metric-s", r.wakeups + " wakeups"));
+    }
+
+    var net = ctl.net[r.name];
+    if (ctl.showNet) {
+      var netCell = el("span", "metric-s", net ? ctlBytes(net.total) + " net" : "\u2013");
+      if (net && net.total) {
+        netCell.title = "rx " + ctlBytes(net.rx) + " / tx " + ctlBytes(net.tx) +
+          (net.shared_uid ? "  (shared uid " + net.uid + ", not attributable to one package)" : "");
+      }
+      row.appendChild(netCell);
     }
 
     var bar = el("div", "bar");
@@ -1676,6 +1741,7 @@ function renderControl() {
   ctlRefreshState();
   ctlLoadFallback();
   ctlLoadPackages();
+  ctlLoadNetwork();
 }
 
 /* -------------------------------------------------------------- routing -- */

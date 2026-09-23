@@ -205,6 +205,17 @@ class Handler(BaseHTTPRequestHandler):
                 "third_party": sorted(index.third_party),
                 "disabled": sorted(index.disabled),
             })
+        if path == "/api/control/network":
+            with _live_lock:
+                session = _live["session"]
+            if session is None:
+                return self._json(409, {"error": "no live session"})
+            try:
+                rows = controlmod.network_by_package(session.shell)
+            except Exception as exc:  # noqa: BLE001
+                return self._json(502, {"error": "could not read netstats: %s" % exc})
+            return self._json(200, {"rows": rows})
+
         if path == "/api/adb":
             try:
                 text = pull_via_adb()
@@ -300,6 +311,20 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, {"ok": True, "capture": cap,
                                     "analysis": analysis,
                                     "analysis_error": analysis_error})
+
+        if path == "/api/control/signals":
+            body = self._read_json_body()
+            with _live_lock:
+                session = _live["session"]
+            if session is None:
+                return self._json(409, {"error": "no live session"})
+            try:
+                return self._json(200, controlmod.package_signals(
+                    session.shell, body.get("package")))
+            except controlmod.ControlError as exc:
+                return self._json(400, {"error": str(exc)})
+            except Exception as exc:  # noqa: BLE001
+                return self._json(502, {"error": "could not read signals: %s" % exc})
 
         if path == "/api/control/plan":
             body = self._read_json_body()
