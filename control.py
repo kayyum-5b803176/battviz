@@ -14,6 +14,7 @@ from it, so it is deliberately conservative:
 """
 
 import re
+import time
 
 # Android package names: at least one dot, no shell metacharacters. Anything
 # that does not match this is rejected outright rather than escaped, because
@@ -188,27 +189,95 @@ def packages_by_uid(shell):
     return mapping
 
 
-def network_by_package(shell):
-    """Per-package network totals, joined from the two sources above."""
-    totals = network_by_uid(shell)
-    by_uid = packages_by_uid(shell)
+def _join_uid_totals_to_packages(totals, by_uid):
+    """Shared join used by both the cumulative and windowed-diff paths, so
+    the shared-uid handling and unattributed-uid fallback stay identical
+    between them rather than drifting if implemented twice."""
     rows = []
     for uid, entry in totals.items():
         pkgs = by_uid.get(uid) or []
         if not pkgs:
-            # Unattributed uids are still worth reporting rather than
-            # silently dropping, since system/kernel uids carry real traffic.
             pkgs = [SYSTEM_UID_LABELS.get(uid, "uid " + uid)]
         for pkg in pkgs:
-            rows.append({
-                "package": pkg,
-                "uid": uid,
-                "rx": entry["rx"],
-                "tx": entry["tx"],
-                "total": entry["total"],
-                "shared_uid": len(by_uid.get(uid) or []) > 1,
-            })
+            row = dict(entry)
+            row["package"] = pkg
+            row["uid"] = uid
+            row["shared_uid"] = len(by_uid.get(uid) or []) > 1
+            rows.append(row)
     rows.sort(key=lambda r: -r["total"])
+    return rows
+
+
+def network_by_package(shell):
+    """All-time cumulative totals - whatever history netstats has retained,
+    with no relationship to any particular capture window. Kept distinct
+    from the windowed diff below rather than conflated with it."""
+    totals = network_by_uid(shell)
+    by_uid = packages_by_uid(shell)
+    return _join_uid_totals_to_packages(totals, by_uid)
+
+
+def force_netstats_poll(shell):
+    """Ask NetworkStatsService to flush its counters to the history buckets.
+
+    Without this, a short-window diff reads the same unflushed buckets twice
+    and correctly subtracts to zero, which looks exactly like "no traffic"
+    even while an app is visibly downloading. Android only persists netstats
+    on its own poll interval (tens of minutes), so the snapshots must trigger
+    a poll themselves. Flag names differ across versions, so several forms
+    are tried; all are harmless no-ops where unsupported.
+    """
+    for cmd in ("dumpsys netstats --poll", "dumpsys netstats poll"):
+        out = shell.run(cmd, timeout=45) or ""
+        low = out.lower()
+        if "unknown" not in low and "usage" not in low and "exception" not in low:
+            return True
+    return False
+
+
+def network_snapshot(shell, poll=True):
+    """One point-in-time read, timestamped, for differencing against a later
+    snapshot. The timestamp is taken immediately after the read completes,
+    since that is when the counters it captured were actually current."""
+    if poll:
+        force_netstats_poll(shell)
+    by_uid = network_by_uid(shell)
+    return {"t": time.time(), "by_uid": by_uid}
+
+
+def network_diff(before, after):
+    """Per-uid bytes transferred strictly between two snapshots.
+
+    netstats counters are cumulative and monotonic under normal operation.
+    A uid whose value went down between snapshots - a stats reset, or the
+    app being killed/cleared mid-window - would otherwise produce a negative
+    number, which is nonsensical as "bytes used". It is clamped to 0 and
+    flagged, rather than shown as a negative or silently hidden.
+    """
+    out = {}
+    for uid in set(before["by_uid"]) | set(after["by_uid"]):
+        b = before["by_uid"].get(uid, {"rx": 0, "tx": 0, "total": 0})
+        a = after["by_uid"].get(uid, {"rx": 0, "tx": 0, "total": 0})
+        rx, tx = a["rx"] - b["rx"], a["tx"] - b["tx"]
+        reset = rx < 0 or tx < 0
+        rx, tx = max(0, rx), max(0, tx)
+        out[uid] = {"rx": rx, "tx": tx, "total": rx + tx, "reset_detected": reset}
+    window_s = max(0.001, after["t"] - before["t"])
+    # A window where literally nothing moved is far more often netstats not
+    # having flushed than a genuinely idle device, so it is reported as an
+    # explicit condition rather than as a confident set of zeros.
+    total_bytes = sum(v["total"] for v in out.values())
+    return {"by_uid": out, "window_s": round(window_s, 3),
+            "started_at": before["t"], "ended_at": after["t"],
+            "total_bytes": total_bytes, "empty": total_bytes == 0}
+
+
+def network_diff_by_package(shell, diff):
+    by_uid = packages_by_uid(shell)
+    rows = _join_uid_totals_to_packages(diff["by_uid"], by_uid)
+    for r in rows:
+        r["window_s"] = diff["window_s"]
+        r["bytes_per_s"] = round(r["total"] / diff["window_s"], 1) if diff["window_s"] else 0
     return rows
 
 

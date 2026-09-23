@@ -60,7 +60,7 @@ _live = {"session": None}
 _live_lock = threading.Lock()
 
 # Last trace capture/analysis, and the package index for the live device.
-_trace = {"capture": None, "analysis": None, "busy": False}
+_trace = {"capture": None, "analysis": None, "busy": False, "network_window": None}
 _trace_lock = threading.Lock()
 _pkg_index = {"index": None}
 
@@ -185,6 +185,7 @@ class Handler(BaseHTTPRequestHandler):
                     "busy": _trace["busy"],
                     "capture": _trace["capture"],
                     "analysis": _trace["analysis"],
+                    "network_window": _trace.get("network_window"),
                     "trace_processor": tracemod.find_trace_processor(),
                 })
         if path == "/api/control/packages":
@@ -286,6 +287,19 @@ class Handler(BaseHTTPRequestHandler):
                 if _trace["busy"]:
                     return self._json(409, {"error": "a capture is already running"})
                 _trace["busy"] = True
+
+            # Netstats snapshots wrap the actual on-device capture() call as
+            # tightly as possible - taken immediately before and after, not
+            # at the nominal requested duration - so the diffed window
+            # matches what really elapsed on the device, adb round trips
+            # included. A snapshot failing (a momentary adb hiccup) should
+            # not fail the trace capture itself, so it is best-effort.
+            net_before = None
+            try:
+                net_before = controlmod.network_snapshot(session.shell)
+            except Exception:  # noqa: BLE001
+                pass
+
             try:
                 cap = tracemod.capture(session.shell, session.serial,
                                        duration_s=int(body.get("duration", 30) or 30))
@@ -297,6 +311,36 @@ class Handler(BaseHTTPRequestHandler):
                 with _trace_lock:
                     _trace["busy"] = False
                 return self._json(500, {"error": "capture failed: %s" % exc})
+
+            net_window = None
+            net_window_s = None
+            net_window_note = None
+            if net_before is not None:
+                try:
+                    net_after = controlmod.network_snapshot(session.shell)
+                    diff = controlmod.network_diff(net_before, net_after)
+                    if diff["empty"]:
+                        # Storing this would show every app as 0 bytes, which
+                        # reads as fact rather than as "nothing was recorded".
+                        # Leave the stored window alone so the UI keeps
+                        # showing cumulative, and say why.
+                        net_window_note = (
+                            "No traffic recorded in this %.1fs window. Android "
+                            "only flushes network counters periodically, so "
+                            "short captures often land between flushes. Try a "
+                            "longer capture." % diff["window_s"])
+                    else:
+                        net_window = controlmod.network_diff_by_package(
+                            session.shell, diff)
+                        net_window_s = diff["window_s"]
+                        with _trace_lock:
+                            _trace["network_window"] = {
+                                "rows": net_window, "window_s": diff["window_s"],
+                                "started_at": diff["started_at"],
+                                "ended_at": diff["ended_at"],
+                            }
+                except Exception as exc:  # noqa: BLE001
+                    net_window_note = "network window unavailable: %s" % exc
 
             analysis, analysis_error = None, None
             try:
@@ -310,7 +354,10 @@ class Handler(BaseHTTPRequestHandler):
                 _trace["busy"] = False
             return self._json(200, {"ok": True, "capture": cap,
                                     "analysis": analysis,
-                                    "analysis_error": analysis_error})
+                                    "analysis_error": analysis_error,
+                                    "network_note": net_window_note,
+                                    "network_window": ({"rows": net_window, "window_s": net_window_s}
+                                                       if net_window is not None else None)})
 
         if path == "/api/control/signals":
             body = self._read_json_body()

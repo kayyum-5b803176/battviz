@@ -1432,7 +1432,7 @@ function renderLive() {
    it is clear whether a number is measured or sampled. */
 
 var ctl = { rows: [], selected: {}, source: "none", pkgInfo: {}, pending: null,
-            net: {}, signals: {}, showNet: false };
+            net: {}, netByUid: {}, signals: {}, showNet: false, netSource: null, netWindowS: null };
 
 function ctlRefreshState() {
   fetch("/api/trace/state").then(function (r) { return r.json(); }).then(function (s) {
@@ -1441,11 +1441,34 @@ function ctlRefreshState() {
     if (s.analysis && s.analysis.culprits) {
       ctl.source = "trace";
       ctl.rows = s.analysis.culprits.map(function (c) {
-        return { name: c.name, cpu: c.cpu_ms, wakeups: c.wakeups,
+        return { name: c.name, uid: c.uid, cpu: c.cpu_ms, wakeups: c.wakeups,
                  threads: c.threads, isPkg: c.is_package, unit: "ms cpu" };
       });
       $("#ctl-source").textContent = "measured from a " +
         (s.capture ? s.capture.duration_s + "s" : "") + " perfetto trace";
+    }
+
+    // Label and row data come from this one fetch together, so they can
+    // never drift out of sync the way they did when a separate fetch owned
+    // the actual ctl.net rows - a capture could complete, update the label
+    // to say "windowed", and leave the rows showing stale cumulative bytes.
+    var nw = s.network_window;
+    if (nw && nw.rows && nw.rows.length) {
+      ctl.net = {};
+      ctl.netByUid = {};
+      nw.rows.forEach(function (row) {
+        ctl.net[row.package] = row;
+        if (row.uid) ctl.netByUid[String(row.uid)] = row;
+      });
+      ctl.netSource = "window";
+      ctl.netWindowS = nw.window_s;
+      ctl.showNet = true;
+      $("#ctl-net-source").textContent =
+        "\u00b7 network from the " + nw.window_s.toFixed(1) + "s capture window";
+    } else {
+      $("#ctl-net-source").textContent =
+        "\u00b7 network is cumulative (all-time), capture a trace for a windowed figure";
+      ctlLoadNetworkCumulative();
     }
     ctlRender();
   }).catch(function () {});
@@ -1466,6 +1489,17 @@ function ctlLoadFallback() {
     }).catch(function () {});
 }
 
+// Joins network data to a culprit row by uid first - the one identifier both
+// the trace's process_tree resolution and netstats' own uid= field discover
+// independently and correctly - falling back to name matching only when a
+// uid was not available on the trace side (e.g. rows sourced from live
+// mode's sampled top, which currently has no uid). Matching on name alone
+// silently drops a row whenever the two sources' name resolution disagrees.
+function ctlNetFor(r) {
+  if (r.uid && ctl.netByUid[String(r.uid)]) return ctl.netByUid[String(r.uid)];
+  return ctl.net[r.name];
+}
+
 function ctlBytes(n) {
   if (!n) return "0";
   if (n >= 1073741824) return (n / 1073741824).toFixed(2) + " GB";
@@ -1477,16 +1511,19 @@ function ctlBytes(n) {
 /* Network bytes are a separate signal from cpu time, not a component of it:
    an app can be near-invisible to a cpu ranking while steadily sending data.
    Shown as its own column rather than folded into the score. */
-function ctlLoadNetwork() {
+function ctlLoadNetworkCumulative() {
   fetch("/api/control/network").then(function (r) {
     if (!r.ok) return null;
     return r.json();
   }).then(function (j) {
     if (!j) return;
     ctl.net = {};
+    ctl.netByUid = {};
     (j.rows || []).forEach(function (row) {
       ctl.net[row.package] = row;
+      if (row.uid) ctl.netByUid[String(row.uid)] = row;
     });
+    ctl.netSource = "cumulative";
     ctl.showNet = true;
     ctlRender();
   }).catch(function () {});
@@ -1517,15 +1554,23 @@ function ctlRender() {
   // The cpu ranking cannot see an app that transfers data without burning
   // cpu - exactly the case worth catching. Any package with network traffic
   // is merged in, so it appears with a real network figure and a zero cpu
-  // figure rather than being absent entirely.
+  // figure rather than being absent entirely. A uid netstats reports real
+  // bytes for but pm could not resolve to a package name is merged in too,
+  // labelled by its uid rather than dropped - visibility matters more here
+  // than strict validation, and control.py's own package-name check already
+  // protects against ever running a disable/restrict action against a
+  // string that turns out not to be a real package.
+  var PKG_RE = /^[a-z][\w]*(\.[\w]+){2,}$/;
   var merged = ctl.rows.slice();
   var seen = {};
   merged.forEach(function (r) { seen[r.name] = true; });
   if (ctl.showNet) {
     Object.keys(ctl.net).forEach(function (pkg) {
       if (seen[pkg] || !ctl.net[pkg].total) return;
-      if (!/^[a-z][\w]*(\.[\w]+){2,}$/.test(pkg)) return;
-      merged.push({ name: pkg, cpu: 0, wakeups: null, isPkg: true, netOnly: true });
+      merged.push({
+        name: pkg, uid: ctl.net[pkg].uid, cpu: 0, wakeups: null,
+        isPkg: true, netOnly: true, unresolved: !PKG_RE.test(pkg)
+      });
     });
   }
 
@@ -1540,7 +1585,7 @@ function ctlRender() {
   // network-only entry is not stranded at the bottom by a zero cpu figure.
   var maxCpu = Math.max.apply(null, rows.map(function (r) { return r.cpu || 0; }).concat([1]));
   var maxNet = Math.max.apply(null, rows.map(function (r) {
-    var n = ctl.net[r.name]; return n ? n.total : 0;
+    var n = ctlNetFor(r); return n ? n.total : 0;
   }).concat([1]));
   rows.sort(function (a, b) {
     var an = ctl.net[a.name], bn = ctl.net[b.name];
@@ -1584,12 +1629,16 @@ function ctlRender() {
       row.appendChild(el("span", "metric-s", r.wakeups + " wakeups"));
     }
 
-    var net = ctl.net[r.name];
+    var net = ctlNetFor(r);
     if (ctl.showNet) {
       var netCell = el("span", "metric-s", net ? ctlBytes(net.total) + " net" : "\u2013");
       if (net && net.total) {
-        netCell.title = "rx " + ctlBytes(net.rx) + " / tx " + ctlBytes(net.tx) +
-          (net.shared_uid ? "  (shared uid " + net.uid + ", not attributable to one package)" : "");
+        var extra = ctl.netSource === "window"
+          ? "  (this " + ctl.netWindowS.toFixed(1) + "s capture window)"
+          : "  (cumulative, all-time since last reset - not this capture)";
+        netCell.title = "rx " + ctlBytes(net.rx) + " / tx " + ctlBytes(net.tx) + extra +
+          (net.shared_uid ? "  \u00b7 shared uid " + net.uid + ", not attributable to one package" : "") +
+          (net.reset_detected ? "  \u00b7 counter reset mid-window, clamped to 0" : "");
       }
       row.appendChild(netCell);
     }
@@ -1605,6 +1654,11 @@ function ctlRender() {
     if (info.disabled) row.appendChild(el("span", "ctl-tag off", "disabled"));
     else if (info.system) row.appendChild(el("span", "ctl-tag sys", "system"));
     else if (info.system === false) row.appendChild(el("span", "ctl-tag", "user app"));
+    else if (r.unresolved) {
+      var utag = el("span", "ctl-tag warn", "unresolved uid");
+      utag.title = "netstats reported real traffic for this uid, but the package name lookup failed for it on this device";
+      row.appendChild(utag);
+    }
 
     host.appendChild(row);
   });
@@ -1727,6 +1781,10 @@ function ctlCapture() {
         msg += " Trace kept at " + cap.path;
         status.className = "";
       }
+      if (res.body.network_note) {
+        msg += "  " + res.body.network_note;
+        status.className = "empty";
+      }
       status.textContent = msg;
       ctlRefreshState();
     }).catch(function (e) {
@@ -1741,7 +1799,6 @@ function renderControl() {
   ctlRefreshState();
   ctlLoadFallback();
   ctlLoadPackages();
-  ctlLoadNetwork();
 }
 
 /* -------------------------------------------------------------- routing -- */

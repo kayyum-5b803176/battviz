@@ -224,12 +224,15 @@ def analyse(trace_path, tp_path=None):
     # start; later ones simply extend/override earlier ones.
     tid_to_pid = {}
     pid_to_name = {}
+    pid_to_uid = {}
     for pkt in trace.packet:
         if pkt.WhichOneof("data") != "process_tree":
             continue
         for p in pkt.process_tree.processes:
             if p.cmdline:
                 pid_to_name[p.pid] = p.cmdline[0]
+            if p.HasField("uid"):
+                pid_to_uid[p.pid] = p.uid
         for th in pkt.process_tree.threads:
             tid_to_pid[th.tid] = th.tgid
 
@@ -272,9 +275,14 @@ def analyse(trace_path, tp_path=None):
         pid = tid_to_pid.get(tid, tid)
         return pid_to_name.get(pid, comm or ("tid %d" % tid))
 
+    def resolve_uid(tid):
+        pid = tid_to_pid.get(tid, tid)
+        return pid_to_uid.get(pid)
+
     proc_ns = collections.Counter()
     proc_wakeups = collections.Counter()
     proc_threads = collections.defaultdict(list)
+    proc_uid = {}
     for (tid, comm), ns in tid_ns.items():
         name = resolve(tid, comm)
         if _is_noise(name):
@@ -282,6 +290,10 @@ def analyse(trace_path, tp_path=None):
         proc_ns[name] += ns
         proc_threads[name].append({"thread": comm or ("tid %d" % tid),
                                    "cpu_ms": round(ns / 1e6, 2)})
+        if name not in proc_uid:
+            u = resolve_uid(tid)
+            if u is not None:
+                proc_uid[name] = u
     for tid, count in wakeups_by_tid.items():
         name = resolve(tid, None)
         if not _is_noise(name):
@@ -295,6 +307,13 @@ def analyse(trace_path, tp_path=None):
         threads = sorted(proc_threads[name], key=lambda t: -t["cpu_ms"])[:8]
         culprits.append({
             "name": name,
+            # The one identifier both this cpu ranking and control.py's
+            # network ranking can resolve independently and correctly, even
+            # when either side's own package-name resolution disagrees or
+            # fails (pm list packages -U output has already been seen to
+            # vary by vendor). The UI joins network data on this first,
+            # falling back to name matching only when it is unavailable.
+            "uid": str(proc_uid[name]) if name in proc_uid else None,
             "cpu_ms": round(cpu_ms, 2),
             "cpu_pct_of_trace": (round(100.0 * cpu_ms / span_ms, 2)
                                  if span_ms else None),
