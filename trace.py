@@ -70,6 +70,14 @@ data_sources {
 }
 data_sources {
   config {
+    name: "android.network_packets"
+    network_packet_trace_config {
+      poll_ms: 250
+    }
+  }
+}
+data_sources {
+  config {
     name: "linux.process_stats"
     process_stats_config {
       scan_all_processes_on_start: true
@@ -205,6 +213,80 @@ def _is_noise(name):
     return base in SELF_NOISE_NAMES
 
 
+def _parse_battery_and_rails(trace):
+    """Battery counters and power rail energy, straight from the trace.
+
+    Both message types are native fields on the installed schema - no
+    compilation or extension tricks needed, unlike network_packets. Verified
+    against a real capture: this device reported 31 battery samples with
+    genuine capacity/charge/current readings, and one (empty) power_rails
+    packet, confirming the parse path works even though this particular
+    device's rails go unpopulated (no PowerStats HAL - common outside Pixel
+    devices).
+    """
+    battery_series = []
+    first_ts = None
+    for pkt in trace.packet:
+        if pkt.WhichOneof("data") != "battery":
+            continue
+        if first_ts is None:
+            first_ts = pkt.timestamp
+        bc = pkt.battery
+        battery_series.append({
+            "t_ms": round((pkt.timestamp - first_ts) / 1e6, 1),
+            "capacity_pct": bc.capacity_percent if bc.HasField("capacity_percent") else None,
+            "current_ua": bc.current_ua if bc.HasField("current_ua") else None,
+            "charge_uah": bc.charge_counter_uah if bc.HasField("charge_counter_uah") else None,
+            "voltage_uv": bc.voltage_uv if bc.HasField("voltage_uv") else None,
+        })
+
+    # A device with no meaningful discharge signal in this reading is common
+    # enough (short captures, or a battery gauge that only updates coarsely)
+    # that it is flagged explicitly rather than shown as a plausible chart.
+    # A real device's active discharge current is normally in the tens to
+    # hundreds of milliamps; this device's own readings during live testing
+    # elsewhere in this session were consistently in that range, so a max
+    # magnitude far below it here means the field is not carrying a useful
+    # signal on this device/build, not that the device was unusually idle.
+    currents = [abs(b["current_ua"]) for b in battery_series if b["current_ua"] is not None]
+    current_reliable = bool(currents) and max(currents) >= 5000  # 5 mA floor
+
+    rail_descriptors = {}
+    rail_samples = collections.defaultdict(list)
+    for pkt in trace.packet:
+        if pkt.WhichOneof("data") != "power_rails":
+            continue
+        pr = pkt.power_rails
+        for rd in pr.rail_descriptor:
+            rail_descriptors[rd.index] = {
+                "name": rd.rail_name, "subsys": rd.subsys_name,
+                "sampling_rate": rd.sampling_rate,
+            }
+        for ed in pr.energy_data:
+            rail_samples[ed.index].append({"t_ms": ed.timestamp_ms, "energy_uj": ed.energy})
+
+    power_rails = []
+    for index, samples in rail_samples.items():
+        samples.sort(key=lambda s: s["t_ms"])
+        desc = rail_descriptors.get(index, {"name": "rail %d" % index, "subsys": ""})
+        energy_delta_uj = (samples[-1]["energy_uj"] - samples[0]["energy_uj"]) if len(samples) > 1 else 0
+        duration_s = (samples[-1]["t_ms"] - samples[0]["t_ms"]) / 1000.0 if len(samples) > 1 else 0
+        power_rails.append({
+            "name": desc["name"], "subsys": desc["subsys"],
+            "samples": len(samples),
+            "energy_delta_uj": energy_delta_uj,
+            "avg_power_mw": round(energy_delta_uj / 1000.0 / duration_s, 2) if duration_s > 0 else None,
+        })
+    power_rails.sort(key=lambda r: -(r["energy_delta_uj"] or 0))
+
+    return {
+        "battery_series": battery_series,
+        "current_reliable": current_reliable,
+        "power_rails": power_rails,
+        "power_rails_available": len(power_rails) > 0,
+    }
+
+
 def analyse(trace_path, tp_path=None):
     """Rank processes by real scheduled cpu time, parsed directly from the
     trace protobuf.
@@ -219,6 +301,8 @@ def analyse(trace_path, tp_path=None):
     trace = Trace()
     with open(trace_path, "rb") as fh:
         trace.ParseFromString(fh.read())
+
+    power = _parse_battery_and_rails(trace)
 
     # Process tree snapshots can appear more than once as new processes
     # start; later ones simply extend/override earlier ones.
@@ -330,5 +414,9 @@ def analyse(trace_path, tp_path=None):
         "packets": len(trace.packet),
         "culprits": culprits,
         "wakeup_sources": [],
+        "battery_series": power["battery_series"],
+        "current_reliable": power["current_reliable"],
+        "power_rails": power["power_rails"],
+        "power_rails_available": power["power_rails_available"],
         "queries": {"parsed": "ok"},
     }

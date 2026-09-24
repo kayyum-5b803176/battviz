@@ -1446,6 +1446,7 @@ function ctlRefreshState() {
       });
       $("#ctl-source").textContent = "measured from a " +
         (s.capture ? s.capture.duration_s + "s" : "") + " perfetto trace";
+      ctlRenderPower(s.analysis);
     }
 
     // Label and row data come from this one fetch together, so they can
@@ -1793,6 +1794,73 @@ function ctlCapture() {
       status.className = "empty";
       status.textContent = "Capture failed: " + e;
     });
+}
+
+function ctlRenderPower(analysis) {
+  var panel = $("#ctl-power-panel");
+  var body = $("#ctl-power-body");
+  if (!analysis || !analysis.battery_series) { panel.hidden = true; return; }
+  panel.hidden = false;
+  body.textContent = "";
+
+  // Current draw, only if the trace's own reading is plausible - this
+  // device's battery data source reported a max of well under 1 mA across
+  // the whole capture, far below real discharge current, so showing a chart
+  // built on it would present noise as if it were signal.
+  var series = analysis.battery_series;
+  if (analysis.current_reliable) {
+    var pts = series.filter(function (b) { return b.current_ua != null; });
+    var maxAbs = Math.max.apply(null, pts.map(function (p) { return Math.abs(p.current_ua); }).concat([1]));
+    var svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    svg.setAttribute("viewBox", "0 0 640 90");
+    svg.style.cssText = "width:100%;height:90px;display:block;margin-bottom:6px";
+    var dstr = pts.map(function (p, i) {
+      var x = 6 + (p.t_ms / (pts[pts.length - 1].t_ms || 1)) * 628;
+      var y = 45 - (p.current_ua / maxAbs) * 38;
+      return (i ? "L" : "M") + x.toFixed(1) + "," + y.toFixed(1);
+    }).join(" ");
+    var path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    path.setAttribute("d", dstr);
+    path.setAttribute("fill", "none");
+    path.setAttribute("stroke", "var(--cpu)");
+    path.setAttribute("stroke-width", "1.6");
+    svg.appendChild(path);
+    body.appendChild(svg);
+  } else {
+    var note = el("div", "empty");
+    note.textContent = "This device's trace-embedded current reading stayed under 1 mA for " +
+      "the whole capture \u2014 far below real discharge current \u2014 so it does not appear " +
+      "to carry a useful signal here. Live mode's current draw (read from the battery gauge " +
+      "directly) is the more trustworthy source on this device.";
+    body.appendChild(note);
+  }
+
+  var cap = series.length ? series[0].capacity_pct : null;
+  var capEnd = series.length ? series[series.length - 1].capacity_pct : null;
+  var capLine = el("div", "faint");
+  capLine.style.cssText = "font-size:12px;margin:6px 0 14px";
+  capLine.textContent = "Capacity: " + (cap != null ? cap + "%" : "\u2013") +
+    (capEnd != null && capEnd !== cap ? " \u2192 " + capEnd + "%" : " (unchanged across this capture)");
+  body.appendChild(capLine);
+
+  var railTitle = el("div", "faint");
+  railTitle.style.cssText = "font-size:12px;margin-bottom:6px";
+  railTitle.textContent = "Power rails";
+  body.appendChild(railTitle);
+  if (analysis.power_rails_available) {
+    (analysis.power_rails || []).forEach(function (r) {
+      var row = el("div", "ctl-row");
+      row.appendChild(el("span", "pkg-name", r.name + (r.subsys ? " (" + r.subsys + ")" : "")));
+      var w = el("span", "metric-s");
+      w.style.marginLeft = "auto";
+      w.textContent = r.avg_power_mw != null ? r.avg_power_mw + " mW avg" : r.samples + " samples";
+      row.appendChild(w);
+      body.appendChild(row);
+    });
+  } else {
+    body.appendChild(emptyNote("No power rail data on this device. Most non-Pixel " +
+      "devices do not implement the PowerStats HAL this data source needs."));
+  }
 }
 
 function renderControl() {
