@@ -402,12 +402,24 @@ button.danger { border-color: var(--alarm); color: var(--alarm); }
 button.danger:hover { background: var(--alarm); color: var(--paper); }
 
 .ctl-row {
-  display: flex; align-items: center; gap: 10px;
+  display: grid;
+  grid-template-columns: 20px minmax(0, 1fr) 64px 76px 76px 70px 92px;
+  align-items: center; gap: 10px;
   padding: 8px 6px; border-bottom: 1px solid var(--rule); font-size: 13.5px;
 }
 .ctl-row:last-child { border-bottom: 0; }
-.ctl-row input[type="checkbox"] { margin: 0; flex: 0 0 auto; }
+.ctl-row input[type="checkbox"] { margin: 0; }
 .ctl-row .pkg-name { font-family: var(--mono); min-width: 0; overflow-wrap: anywhere; }
+.ctl-row .col-cpu, .ctl-row .col-wake, .ctl-row .col-net {
+  color: var(--ink-2); font-variant-numeric: tabular-nums; white-space: nowrap; text-align: right;
+}
+.ctl-row .col-bar { width: 70px; }
+.ctl-row .col-tag { display: flex; justify-content: flex-end; min-width: 0; }
+.ctl-row-head {
+  color: var(--ink-3); font-size: 11.5px; text-transform: uppercase; letter-spacing: 0.02em;
+  border-bottom: 1px solid var(--rule-2); padding-bottom: 6px;
+}
+.ctl-row-head .col-cpu, .ctl-row-head .col-wake, .ctl-row-head .col-net { text-align: right; }
 .ctl-row .metric-s { color: var(--ink-2); font-variant-numeric: tabular-nums; white-space: nowrap; }
 .ctl-tag {
   font-size: 10.5px; padding: 1px 7px; border-radius: 9px; white-space: nowrap;

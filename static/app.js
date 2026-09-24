@@ -1604,6 +1604,16 @@ function ctlRender() {
   }
 
   var max = maxCpu;
+  var header = el("div", "ctl-row ctl-row-head");
+  header.appendChild(el("span"));
+  header.appendChild(el("span", "pkg-name", "Package"));
+  header.appendChild(el("span", "col-cpu", "CPU"));
+  header.appendChild(el("span", "col-wake", "Wakeups"));
+  header.appendChild(el("span", "col-net", "Net"));
+  header.appendChild(el("span", "col-bar"));
+  header.appendChild(el("span", "col-tag"));
+  host.appendChild(header);
+
   rows.forEach(function (r) {
     var info = ctl.pkgInfo[r.name] || {};
     var row = el("div", "ctl-row");
@@ -1618,48 +1628,42 @@ function ctlRender() {
     });
     row.appendChild(cb);
 
-    var name = el("span", "pkg-name", r.name);
-    name.style.flex = "1";
-    row.appendChild(name);
+    row.appendChild(el("span", "pkg-name", r.name));
 
-    if (r.cpu != null) {
-      row.appendChild(el("span", "metric-s", (r.cpu >= 1000
-        ? (r.cpu / 1000).toFixed(1) + "s" : Math.round(r.cpu) + "ms") + " cpu"));
-    }
-    if (r.wakeups != null) {
-      row.appendChild(el("span", "metric-s", r.wakeups + " wakeups"));
-    }
+    row.appendChild(el("span", "col-cpu", r.cpu == null ? "\u2013"
+      : (r.cpu >= 1000 ? (r.cpu / 1000).toFixed(1) + "s" : Math.round(r.cpu) + "ms")));
+
+    row.appendChild(el("span", "col-wake", r.wakeups == null ? "\u2013" : String(r.wakeups)));
 
     var net = ctlNetFor(r);
-    if (ctl.showNet) {
-      var netCell = el("span", "metric-s", net ? ctlBytes(net.total) + " net" : "\u2013");
-      if (net && net.total) {
-        var extra = ctl.netSource === "window"
-          ? "  (this " + ctl.netWindowS.toFixed(1) + "s capture window)"
-          : "  (cumulative, all-time since last reset - not this capture)";
-        netCell.title = "rx " + ctlBytes(net.rx) + " / tx " + ctlBytes(net.tx) + extra +
-          (net.shared_uid ? "  \u00b7 shared uid " + net.uid + ", not attributable to one package" : "") +
-          (net.reset_detected ? "  \u00b7 counter reset mid-window, clamped to 0" : "");
-      }
-      row.appendChild(netCell);
+    var netCell = el("span", "col-net", net ? ctlBytes(net.total) : "\u2013");
+    if (ctl.showNet && net && net.total) {
+      var extra = ctl.netSource === "window"
+        ? "  (this " + ctl.netWindowS.toFixed(1) + "s capture window)"
+        : "  (cumulative, all-time since last reset - not this capture)";
+      netCell.title = "rx " + ctlBytes(net.rx) + " / tx " + ctlBytes(net.tx) + extra +
+        (net.shared_uid ? "  \u00b7 shared uid " + net.uid + ", not attributable to one package" : "") +
+        (net.reset_detected ? "  \u00b7 counter reset mid-window, clamped to 0" : "");
     }
+    row.appendChild(netCell);
 
-    var bar = el("div", "bar");
-    bar.style.width = "70px";
+    var bar = el("div", "bar col-bar");
     var seg = el("span");
     seg.style.width = pct(r.cpu || 0, max) + "%";
     seg.style.background = "var(--cpu)";
     bar.appendChild(seg);
     row.appendChild(bar);
 
-    if (info.disabled) row.appendChild(el("span", "ctl-tag off", "disabled"));
-    else if (info.system) row.appendChild(el("span", "ctl-tag sys", "system"));
-    else if (info.system === false) row.appendChild(el("span", "ctl-tag", "user app"));
+    var tag = el("span", "col-tag");
+    if (info.disabled) tag.appendChild(el("span", "ctl-tag off", "disabled"));
+    else if (info.system) tag.appendChild(el("span", "ctl-tag sys", "system"));
+    else if (info.system === false) tag.appendChild(el("span", "ctl-tag", "user app"));
     else if (r.unresolved) {
       var utag = el("span", "ctl-tag warn", "unresolved uid");
       utag.title = "netstats reported real traffic for this uid, but the package name lookup failed for it on this device";
-      row.appendChild(utag);
+      tag.appendChild(utag);
     }
+    row.appendChild(tag);
 
     host.appendChild(row);
   });
@@ -1758,10 +1762,19 @@ function ctlCapture() {
   var btn = $("#ctl-capture");
   var dur = parseInt($("#ctl-duration").value, 10) || 30;
   btn.disabled = true;
-  btn.textContent = "Capturing " + dur + "s";
   var status = $("#ctl-capture-status");
   status.className = "";
   status.textContent = "Recording. Use the phone normally so the trace has something in it.";
+
+  // Capture is one blocking request for the whole duration, so the
+  // countdown is purely a client-side clock started alongside it - it does
+  // not know the device's actual progress, only elapsed wall time.
+  var remaining = dur;
+  btn.textContent = "Capturing " + remaining + "s";
+  var timer = setInterval(function () {
+    remaining -= 1;
+    btn.textContent = remaining > 0 ? "Capturing " + remaining + "s" : "Finishing\u2026";
+  }, 1000);
 
   fetch("/api/trace/capture", {
     method: "POST", headers: { "Content-Type": "application/json" },
@@ -1769,6 +1782,7 @@ function ctlCapture() {
   }).then(function (r) { return r.json().then(function (j) {
     return { ok: r.ok, body: j }; }); })
     .then(function (res) {
+      clearInterval(timer);
       btn.disabled = false;
       btn.textContent = "Capture trace";
       if (!res.ok) { status.className = "empty"; status.textContent = res.body.error; return; }
@@ -1789,6 +1803,7 @@ function ctlCapture() {
       status.textContent = msg;
       ctlRefreshState();
     }).catch(function (e) {
+      clearInterval(timer);
       btn.disabled = false;
       btn.textContent = "Capture trace";
       status.className = "empty";
