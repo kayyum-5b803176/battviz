@@ -1432,7 +1432,8 @@ function renderLive() {
    it is clear whether a number is measured or sampled. */
 
 var ctl = { rows: [], selected: {}, source: "none", pkgInfo: {}, pending: null,
-            net: {}, netByUid: {}, signals: {}, showNet: false, netSource: null, netWindowS: null };
+            net: {}, netByUid: {}, signals: {}, showNet: false, netSource: null, netWindowS: null,
+            sortKey: null, sortDir: -1 };
 
 function ctlRefreshState() {
   fetch("/api/trace/state").then(function (r) { return r.json(); }).then(function (s) {
@@ -1547,10 +1548,27 @@ function ctlLoadPackages() {
   }).catch(function () {});
 }
 
+function ctlSortHeader(key, label) {
+  var colClass = key === "cpu" ? "col-cpu" : key === "wakeups" ? "col-wake" : "col-net";
+  var cell = el("span", colClass + " ctl-sortable");
+  var text = el("span", null, label);
+  cell.appendChild(text);
+  if (ctl.sortKey === key) {
+    cell.appendChild(el("span", "ctl-sort-arrow", ctl.sortDir === -1 ? "\u25be" : "\u25b4"));
+  }
+  cell.addEventListener("click", function () {
+    if (ctl.sortKey === key) ctl.sortDir = -ctl.sortDir;
+    else { ctl.sortKey = key; ctl.sortDir = -1; }
+    ctlRender();
+  });
+  return cell;
+}
+
 function ctlRender() {
   var host = $("#ctl-list");
   host.textContent = "";
   var hideSystem = $("#ctl-hide-system").checked;
+  var hideUnresolved = $("#ctl-hide-unresolved").checked;
 
   // The cpu ranking cannot see an app that transfers data without burning
   // cpu - exactly the case worth catching. Any package with network traffic
@@ -1579,21 +1597,36 @@ function ctlRender() {
     if (!r.isPkg) return false;
     var info = ctl.pkgInfo[r.name];
     if (hideSystem && info && info.system) return false;
+    if (hideUnresolved && r.unresolved) return false;
     return true;
   });
 
-  // Sort by whichever signal is larger relative to its own column max, so a
-  // network-only entry is not stranded at the bottom by a zero cpu figure.
   var maxCpu = Math.max.apply(null, rows.map(function (r) { return r.cpu || 0; }).concat([1]));
   var maxNet = Math.max.apply(null, rows.map(function (r) {
     var n = ctlNetFor(r); return n ? n.total : 0;
   }).concat([1]));
-  rows.sort(function (a, b) {
-    var an = ctl.net[a.name], bn = ctl.net[b.name];
-    var as = Math.max((a.cpu || 0) / maxCpu, (an ? an.total : 0) / maxNet);
-    var bs = Math.max((b.cpu || 0) / maxCpu, (bn ? bn.total : 0) / maxNet);
-    return bs - as;
-  });
+
+  if (ctl.sortKey) {
+    // An explicit column was clicked: sort strictly on that value. Missing
+    // data (null wakeups on a network-only row, no net figure at all) sorts
+    // as 0 rather than being treated as highest or dropped.
+    rows.sort(function (a, b) {
+      var av, bv;
+      if (ctl.sortKey === "cpu") { av = a.cpu || 0; bv = b.cpu || 0; }
+      else if (ctl.sortKey === "wakeups") { av = a.wakeups || 0; bv = b.wakeups || 0; }
+      else { var an = ctlNetFor(a), bn = ctlNetFor(b); av = an ? an.total : 0; bv = bn ? bn.total : 0; }
+      return (av - bv) * ctl.sortDir;
+    });
+  } else {
+    // Default: whichever signal is larger relative to its own column max, so
+    // a network-only entry is not stranded at the bottom by a zero cpu figure.
+    rows.sort(function (a, b) {
+      var an = ctlNetFor(a), bn = ctlNetFor(b);
+      var as = Math.max((a.cpu || 0) / maxCpu, (an ? an.total : 0) / maxNet);
+      var bs = Math.max((b.cpu || 0) / maxCpu, (bn ? bn.total : 0) / maxNet);
+      return bs - as;
+    });
+  }
 
   if (!rows.length) {
     host.appendChild(emptyNote(ctl.rows.length
@@ -1607,9 +1640,9 @@ function ctlRender() {
   var header = el("div", "ctl-row ctl-row-head");
   header.appendChild(el("span"));
   header.appendChild(el("span", "pkg-name", "Package"));
-  header.appendChild(el("span", "col-cpu", "CPU"));
-  header.appendChild(el("span", "col-wake", "Wakeups"));
-  header.appendChild(el("span", "col-net", "Net"));
+  header.appendChild(ctlSortHeader("cpu", "CPU"));
+  header.appendChild(ctlSortHeader("wakeups", "Wakeups"));
+  header.appendChild(ctlSortHeader("net", "Net"));
   header.appendChild(el("span", "col-bar"));
   header.appendChild(el("span", "col-tag"));
   host.appendChild(header);
@@ -2009,6 +2042,7 @@ document.addEventListener("DOMContentLoaded", function () {
   $("#live-refresh").addEventListener("click", liveFetchDevices);
   $("#ctl-capture").addEventListener("click", ctlCapture);
   $("#ctl-hide-system").addEventListener("change", ctlRender);
+  $("#ctl-hide-unresolved").addEventListener("change", ctlRender);
   document.querySelectorAll("#ctl-actionbar button[data-act]").forEach(function (b) {
     b.addEventListener("click", function () { ctlPlanAll(b.dataset.act); });
   });

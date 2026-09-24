@@ -420,6 +420,9 @@ button.danger:hover { background: var(--alarm); color: var(--paper); }
   border-bottom: 1px solid var(--rule-2); padding-bottom: 6px;
 }
 .ctl-row-head .col-cpu, .ctl-row-head .col-wake, .ctl-row-head .col-net { text-align: right; }
+.ctl-sortable { cursor: pointer; display: flex; align-items: center; justify-content: flex-end; gap: 3px; }
+.ctl-sortable:hover { color: var(--ink); }
+.ctl-sort-arrow { font-size: 9px; color: var(--ink); }
 .ctl-row .metric-s { color: var(--ink-2); font-variant-numeric: tabular-nums; white-space: nowrap; }
 .ctl-tag {
   font-size: 10.5px; padding: 1px 7px; border-radius: 9px; white-space: nowrap;
