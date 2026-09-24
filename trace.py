@@ -68,15 +68,7 @@ data_sources {
     }
   }
 }
-data_sources {
-  config {
-    name: "android.network_packets"
-    network_packet_trace_config {
-      poll_ms: 250
-    }
-  }
-}
-data_sources {
+%(network_packets_block)sdata_sources {
   config {
     name: "linux.process_stats"
     process_stats_config {
@@ -97,6 +89,22 @@ data_sources {
   }
 }
 duration_ms: %(duration_ms)d
+"""
+
+# android.network_packets was only added to the on-device perfetto binary's
+# own schema in Android 14. The on-device pbtxt parser rejects a config
+# containing ANY field it does not recognise as a hard error for the WHOLE
+# config, not just the unrecognised part - so on Android 12/13 this single
+# block silently broke capture entirely (cpu, wakeups, everything), not just
+# network data. Included only when the device is confirmed new enough.
+NETWORK_PACKETS_BLOCK = """data_sources {
+  config {
+    name: "android.network_packets"
+    network_packet_trace_config {
+      poll_ms: 250
+    }
+  }
+}
 """
 
 # ftrace-visible processes that are not real culprits. Two kinds: the
@@ -144,6 +152,21 @@ def find_trace_processor(explicit=None):
         return None
 
 
+def _supports_network_packets(shell):
+    """SDK 34 (Android 14) is when network_packet_trace_config was added to
+    the on-device schema. Checked by SDK int rather than the release string,
+    since that's what the platform itself guarantees monotonically increases.
+    Any failure to read it is treated as "no" - the failure mode of wrongly
+    omitting network data is far better than wrongly including a field that
+    breaks the entire capture on an older device.
+    """
+    try:
+        out = shell.run("getprop ro.build.version.sdk", timeout=10).strip()
+        return int(out) >= 34
+    except (ValueError, AttributeError):
+        return False
+
+
 def capture(shell, serial, duration_s=30, out_dir=None):
     """Record a trace on the device and pull it to the host.
 
@@ -157,7 +180,9 @@ def capture(shell, serial, duration_s=30, out_dir=None):
     out_dir = out_dir or tempfile.gettempdir()
     local_path = os.path.join(out_dir, "battviz-%s.perfetto-trace" % stamp)
 
-    config = TRACE_CONFIG % {"duration_ms": duration_s * 1000}
+    network_block = NETWORK_PACKETS_BLOCK if _supports_network_packets(shell) else ""
+    config = TRACE_CONFIG % {"duration_ms": duration_s * 1000,
+                             "network_packets_block": network_block}
 
     base = ["adb"]
     if serial:
@@ -182,6 +207,12 @@ def capture(shell, serial, duration_s=30, out_dir=None):
         if "permission" in err.lower() or "denied" in err.lower():
             hint = (" Tracing may be disabled on this build. On Android 9-10 "
                     "try: adb shell setprop persist.traced.enable 1")
+        elif "no field named" in err.lower():
+            hint = (" The on-device perfetto binary rejected a config field it "
+                    "does not recognise - this usually means a data source "
+                    "added in a newer Android version than this device runs. "
+                    "If this recurs, it likely needs the same version-gating "
+                    "network_packets already has in this file.")
         raise TraceError("perfetto failed: %s%s" % (err[:400] or "unknown error", hint))
 
     pull = subprocess.run(base + ["pull", device_path, local_path],
