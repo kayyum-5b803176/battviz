@@ -478,3 +478,9 @@ button.danger:hover { background: var(--alarm); color: var(--paper); }
   margin-bottom: 16px;
 }
 #tl-gap-banner b { font-weight: 550; }
+
+.ctl-profile {
+  display: inline-block; margin-left: 6px; font-size: 10px; padding: 0 5px;
+  border-radius: 8px; background: var(--sunken); color: var(--ink-2);
+  border: 1px solid var(--rule-2); vertical-align: 1px; cursor: help;
+}

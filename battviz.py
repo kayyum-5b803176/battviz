@@ -199,12 +199,14 @@ class Handler(BaseHTTPRequestHandler):
                 _pkg_index["index"] = index
             try:
                 index.refresh()
+                users = controlmod.list_users(session.shell)
             except Exception as exc:  # noqa: BLE001
                 return self._json(502, {"error": "could not list packages: %s" % exc})
             return self._json(200, {
                 "system": sorted(index.system),
                 "third_party": sorted(index.third_party),
                 "disabled": sorted(index.disabled),
+                "users": users,
             })
         if path == "/api/control/network":
             with _live_lock:
@@ -383,7 +385,8 @@ class Handler(BaseHTTPRequestHandler):
                 _pkg_index["index"] = index
             try:
                 return self._json(200, controlmod.plan(
-                    body.get("package"), body.get("action"), index=index))
+                    body.get("package"), body.get("action"), index=index,
+                    user=body.get("user", "0")))
             except controlmod.ControlError as exc:
                 return self._json(400, {"error": str(exc)})
 
@@ -400,7 +403,8 @@ class Handler(BaseHTTPRequestHandler):
                 _pkg_index["index"] = index
             try:
                 result = controlmod.apply(session.shell, body.get("package"),
-                                          body.get("action"), index=index)
+                                          body.get("action"), index=index,
+                                          user=body.get("user", "0"))
             except controlmod.ControlError as exc:
                 return self._json(400, {"error": str(exc)})
             except Exception as exc:  # noqa: BLE001

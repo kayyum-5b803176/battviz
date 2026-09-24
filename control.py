@@ -16,6 +16,8 @@ from it, so it is deliberately conservative:
 import re
 import time
 
+import parser as _parser
+
 # Android package names: at least one dot, no shell metacharacters. Anything
 # that does not match this is rejected outright rather than escaped, because
 # there is no legitimate package name that needs escaping.
@@ -68,7 +70,7 @@ def validate_package(pkg):
 ACTIONS = {
     "force-stop": {
         "label": "Force stop",
-        "command": "am force-stop %s",
+        "command": "am force-stop --user %(user)s %(pkg)s",
         "effect": "Kills the app's processes now. It restarts on next launch "
                   "or next scheduled job, so this is a temporary measure.",
         "undo": None,
@@ -78,40 +80,40 @@ ACTIONS = {
     },
     "restrict": {
         "label": "Restrict background",
-        "command": "am set-standby-bucket %s restricted",
+        "command": "am set-standby-bucket --user %(user)s %(pkg)s restricted",
         "effect": "Puts the app in the restricted standby bucket. Background "
                   "jobs, alarms and network are heavily throttled. The app "
                   "still works in the foreground.",
-        "undo": "am set-standby-bucket %s active",
+        "undo": "am set-standby-bucket --user %(user)s %(pkg)s active",
         "undo_label": "Unrestrict",
         "destructive": False,
         "allow_system": True,
     },
     "unrestrict": {
         "label": "Unrestrict",
-        "command": "am set-standby-bucket %s active",
+        "command": "am set-standby-bucket --user %(user)s %(pkg)s active",
         "effect": "Returns the app to the active standby bucket.",
-        "undo": "am set-standby-bucket %s restricted",
+        "undo": "am set-standby-bucket --user %(user)s %(pkg)s restricted",
         "undo_label": "Restrict again",
         "destructive": False,
         "allow_system": True,
     },
     "disable": {
         "label": "Disable",
-        "command": "pm disable-user --user 0 %s",
+        "command": "pm disable-user --user %(user)s %(pkg)s",
         "effect": "Stops the app from running at all until re-enabled. It "
                   "stays installed and keeps its data. Notifications and "
                   "background sync stop.",
-        "undo": "pm enable %s",
+        "undo": "pm enable --user %(user)s %(pkg)s",
         "undo_label": "Enable",
         "destructive": True,
         "allow_system": False,
     },
     "enable": {
         "label": "Enable",
-        "command": "pm enable %s",
+        "command": "pm enable --user %(user)s %(pkg)s",
         "effect": "Re-enables a previously disabled app.",
-        "undo": "pm disable-user --user 0 %s",
+        "undo": "pm disable-user --user %(user)s %(pkg)s",
         "undo_label": "Disable",
         "destructive": False,
         "allow_system": True,
@@ -170,39 +172,88 @@ def network_by_uid(shell):
 
 
 _PKG_UID_LINE = re.compile(r"^package:(\S+?)\s+uid:(\d+)\s*$")
+_USER_LINE = re.compile(r"UserInfo\{(\d+):([^:}]*):")
+
+
+def list_users(shell):
+    """Every user profile on the device, from `pm list users`.
+
+    A device with a work profile, a second space, or an OEM clone-app
+    feature (observed: OPlus's app-twin) has more than one profile, and each
+    encodes its own set of app uids - `pm list packages -U` with no --user
+    flag only ever sees the primary profile (0), which is exactly why a
+    uid from any other profile came back unresolved before this existed.
+    """
+    out = shell.run("pm list users", timeout=20)
+    users = []
+    for line in out.splitlines():
+        m = _USER_LINE.search(line)
+        if m:
+            users.append({"id": m.group(1), "name": m.group(2).strip()})
+    return users or [{"id": "0", "name": "primary"}]
+
+
+def profile_of_uid(uid):
+    """Android encodes uid = profile*100000 + appId. Works out which profile
+    a uid belongs to from the number alone, regardless of whether pm ever
+    resolved a package name for it - so a row can always show which profile
+    it is in, even when the name itself stays unresolved."""
+    try:
+        n = int(uid)
+    except (TypeError, ValueError):
+        return None
+    return n // 100000 if n >= 100000 else 0
 
 
 def packages_by_uid(shell):
-    """Map uid -> [package names] using `pm list packages -U`.
+    """Map uid -> [package names], across every user profile on the device.
 
     Several packages can share a uid (sharedUserId), so this is a list, not a
     single name, and the UI shows all of them rather than picking one.
     """
-    out = shell.run("pm list packages -U", timeout=45)
     mapping = {}
-    for line in out.splitlines():
-        m = _PKG_UID_LINE.match(line.strip())
-        if not m:
-            continue
-        pkg, uid = m.group(1), m.group(2)
-        mapping.setdefault(uid, []).append(pkg)
+    for user in list_users(shell):
+        out = shell.run("pm list packages -U --user %s" % user["id"], timeout=45)
+        for line in out.splitlines():
+            m = _PKG_UID_LINE.match(line.strip())
+            if not m:
+                continue
+            pkg, uid = m.group(1), m.group(2)
+            mapping.setdefault(uid, []).append(pkg)
     return mapping
 
 
 def _join_uid_totals_to_packages(totals, by_uid):
     """Shared join used by both the cumulative and windowed-diff paths, so
     the shared-uid handling and unattributed-uid fallback stay identical
-    between them rather than drifting if implemented twice."""
+    between them rather than drifting if implemented twice.
+
+    `resolved` is set explicitly here rather than left for the frontend to
+    guess from whether the label happens to look like a dotted package name -
+    that guess previously flagged legitimate AID labels ("kernel / root",
+    "gps / location") as "unresolved" purely because they contain spaces,
+    when they are in fact accurately resolved, just not to a package name.
+    Only the literal "uid <n>" fallback is genuinely unresolved.
+    """
     rows = []
     for uid, entry in totals.items():
         pkgs = by_uid.get(uid) or []
+        resolved = bool(pkgs)
         if not pkgs:
-            pkgs = [SYSTEM_UID_LABELS.get(uid, "uid " + uid)]
+            label = SYSTEM_UID_LABELS.get(uid)
+            if label:
+                pkgs = [label]
+                resolved = True
+            else:
+                pkgs = ["uid " + uid]
+                resolved = False
         for pkg in pkgs:
             row = dict(entry)
             row["package"] = pkg
             row["uid"] = uid
+            row["profile"] = profile_of_uid(uid)
             row["shared_uid"] = len(by_uid.get(uid) or []) > 1
+            row["resolved"] = resolved
             rows.append(row)
     rows.sort(key=lambda r: -r["total"])
     return rows
@@ -281,15 +332,7 @@ def network_diff_by_package(shell, diff):
     return rows
 
 
-SYSTEM_UID_LABELS = {
-    "0": "kernel / root",
-    "1000": "android system",
-    "1001": "telephony / radio",
-    "1010": "wifi stack",
-    "1013": "mediaserver",
-    "1021": "gps / location",
-    "9999": "nobody",
-}
+SYSTEM_UID_LABELS = _parser.SYSTEM_UIDS  # single shared, AOSP-verified table
 
 
 # Install location is a real, queryable signal about how privileged a package
@@ -336,7 +379,11 @@ def package_signals(shell, pkg):
 
 
 class PackageIndex(object):
-    """Caches which packages are installed, system, and currently disabled."""
+    """Caches which packages are installed, system, and currently disabled,
+    across every user profile on the device - a package that only exists
+    under a work profile or a second space would otherwise read as "not
+    installed" simply because the primary profile was the only one checked,
+    which would incorrectly block a valid action against it."""
 
     def __init__(self, shell):
         self.shell = shell
@@ -347,14 +394,16 @@ class PackageIndex(object):
 
     def refresh(self):
         def names(flag):
-            out = self.shell.run("pm list packages %s" % flag, timeout=30)
             found = set()
-            for line in out.splitlines():
-                line = line.strip()
-                if line.startswith("package:"):
-                    name = line.split(":", 1)[1].strip()
-                    if name:
-                        found.add(name)
+            for user in list_users(self.shell):
+                out = self.shell.run("pm list packages %s --user %s"
+                                     % (flag, user["id"]), timeout=30)
+                for line in out.splitlines():
+                    line = line.strip()
+                    if line.startswith("package:"):
+                        name = line.split(":", 1)[1].strip()
+                        if name:
+                            found.add(name)
             return found
 
         self.system = names("-s")
@@ -376,16 +425,22 @@ class PackageIndex(object):
         }
 
 
-def plan(pkg, action, index=None, force=False):
+def plan(pkg, action, index=None, force=False, user="0"):
     """Describe what an action would do, without running it.
 
     The UI calls this first so the person sees the exact command and its
-    consequence before anything happens.
+    consequence before anything happens. `user` is the Android user-profile
+    id the package lives under - a device with a work profile, a second
+    space, or an OEM clone-app feature has more than one, and the wrong one
+    means the command silently targets a package that is not actually there.
     """
     pkg = validate_package(pkg)
     if action not in ACTIONS:
         raise ControlError("unknown action: %r" % action)
     spec = ACTIONS[action]
+    user = str(user) if user is not None else "0"
+    if not re.match(r"^\d+$", user):
+        raise ControlError("not a valid user id: %r" % user)
 
     info = index.info(pkg) if index else {"package": pkg, "installed": None,
                                           "system": None, "third_party": None,
@@ -407,13 +462,15 @@ def plan(pkg, action, index=None, force=False):
     if info.get("installed") is False:
         blocked = "%s is not installed on this device." % pkg
 
+    fmt = {"pkg": pkg, "user": user}
     return {
         "package": pkg,
+        "user": user,
         "action": action,
         "label": spec["label"],
-        "command": spec["command"] % pkg,
+        "command": spec["command"] % fmt,
         "effect": spec["effect"],
-        "undo_command": (spec["undo"] % pkg) if spec["undo"] else None,
+        "undo_command": (spec["undo"] % fmt) if spec["undo"] else None,
         "undo_label": spec["undo_label"],
         "destructive": spec["destructive"],
         "blocked": blocked,
@@ -422,9 +479,9 @@ def plan(pkg, action, index=None, force=False):
     }
 
 
-def apply(shell, pkg, action, index=None, force=False):
+def apply(shell, pkg, action, index=None, force=False, user="0"):
     """Run an action after re-checking its plan. Returns the plan plus result."""
-    p = plan(pkg, action, index=index, force=force)
+    p = plan(pkg, action, index=index, force=force, user=user)
     if p["blocked"]:
         raise ControlError(p["blocked"])
 

@@ -1433,7 +1433,7 @@ function renderLive() {
 
 var ctl = { rows: [], selected: {}, source: "none", pkgInfo: {}, pending: null,
             net: {}, netByUid: {}, signals: {}, showNet: false, netSource: null, netWindowS: null,
-            sortKey: null, sortDir: -1 };
+            sortKey: null, sortDir: -1, users: {} };
 
 function ctlRefreshState() {
   fetch("/api/trace/state").then(function (r) { return r.json(); }).then(function (s) {
@@ -1515,20 +1515,31 @@ function ctlBytes(n) {
    Shown as its own column rather than folded into the score. */
 function ctlLoadNetworkCumulative() {
   fetch("/api/control/network").then(function (r) {
-    if (!r.ok) return null;
-    return r.json();
-  }).then(function (j) {
-    if (!j) return;
+    return r.json().then(function (j) { return { ok: r.ok, body: j }; });
+  }).then(function (res) {
+    if (!res.ok) {
+      // Previously swallowed silently, which looked identical to a genuinely
+      // empty result - a wall of dashes with no way to tell which it was.
+      $("#ctl-net-source").textContent =
+        "\u00b7 network unavailable: " + (res.body && res.body.error || "request failed");
+      return;
+    }
     ctl.net = {};
     ctl.netByUid = {};
-    (j.rows || []).forEach(function (row) {
+    (res.body.rows || []).forEach(function (row) {
       ctl.net[row.package] = row;
       if (row.uid) ctl.netByUid[String(row.uid)] = row;
     });
     ctl.netSource = "cumulative";
     ctl.showNet = true;
+    if (!(res.body.rows || []).length) {
+      $("#ctl-net-source").textContent =
+        "\u00b7 network is cumulative (all-time), but netstats currently reports zero rows on this device";
+    }
     ctlRender();
-  }).catch(function () {});
+  }).catch(function (e) {
+    $("#ctl-net-source").textContent = "\u00b7 network unavailable: " + e;
+  });
 }
 
 function ctlLoadPackages() {
@@ -1544,8 +1555,19 @@ function ctlLoadPackages() {
       ctl.pkgInfo[n] = ctl.pkgInfo[n] || {};
       ctl.pkgInfo[n].disabled = true;
     });
+    ctl.users = {};
+    (p.users || []).forEach(function (u) { ctl.users[String(u.id)] = u.name; });
     ctlRender();
   }).catch(function () {});
+}
+
+// Android encodes uid = profile*100000 + appId. A row's profile is worked
+// out from its uid directly, so a badge can be shown even for a uid pm
+// never resolved a name for - visibility does not depend on resolution.
+function ctlProfileOf(r) {
+  var uid = r.uid != null ? parseInt(r.uid, 10) : (ctlNetFor(r) || {}).uid;
+  if (uid == null || isNaN(uid)) return null;
+  return uid >= 100000 ? Math.floor(uid / 100000) : 0;
 }
 
 function ctlSortHeader(key, label) {
@@ -1579,7 +1601,12 @@ function ctlRender() {
   // than strict validation, and control.py's own package-name check already
   // protects against ever running a disable/restrict action against a
   // string that turns out not to be a real package.
-  var PKG_RE = /^[a-z][\w]*(\.[\w]+){2,}$/;
+  //
+  // "unresolved" comes straight from the backend's own resolved flag, not
+  // from guessing here whether the label looks like a dotted package name -
+  // that guess previously flagged legitimate AID labels ("kernel / root")
+  // as unresolved purely because they contain a space, when they are in
+  // fact accurately resolved, just not to a package name.
   var merged = ctl.rows.slice();
   var seen = {};
   merged.forEach(function (r) { seen[r.name] = true; });
@@ -1588,7 +1615,7 @@ function ctlRender() {
       if (seen[pkg] || !ctl.net[pkg].total) return;
       merged.push({
         name: pkg, uid: ctl.net[pkg].uid, cpu: 0, wakeups: null,
-        isPkg: true, netOnly: true, unresolved: !PKG_RE.test(pkg)
+        isPkg: true, netOnly: true, unresolved: ctl.net[pkg].resolved === false
       });
     });
   }
@@ -1650,18 +1677,27 @@ function ctlRender() {
   rows.forEach(function (r) {
     var info = ctl.pkgInfo[r.name] || {};
     var row = el("div", "ctl-row");
+    var profile = ctlProfileOf(r);
 
     var cb = document.createElement("input");
     cb.type = "checkbox";
     cb.checked = !!ctl.selected[r.name];
     cb.addEventListener("change", function () {
-      if (cb.checked) ctl.selected[r.name] = true;
+      if (cb.checked) ctl.selected[r.name] = { profile: profile == null ? "0" : String(profile) };
       else delete ctl.selected[r.name];
       ctlUpdateBar();
     });
     row.appendChild(cb);
 
-    row.appendChild(el("span", "pkg-name", r.name));
+    var nameCell = el("span", "pkg-name", r.name);
+    if (profile != null && profile !== 0) {
+      var pbadge = el("span", "ctl-profile", "u" + profile);
+      pbadge.title = (ctl.users[String(profile)] || "profile " + profile) +
+        " \u2014 a different user profile on this device (work profile, second " +
+        "space, or a cloned app), not the primary one";
+      nameCell.appendChild(pbadge);
+    }
+    row.appendChild(nameCell);
 
     row.appendChild(el("span", "col-cpu", r.cpu == null ? "\u2013"
       : (r.cpu >= 1000 ? (r.cpu / 1000).toFixed(1) + "s" : Math.round(r.cpu) + "ms")));
@@ -1713,9 +1749,10 @@ function ctlPlanAll(action) {
   var names = Object.keys(ctl.selected);
   if (!names.length) return;
   Promise.all(names.map(function (pkg) {
+    var user = (ctl.selected[pkg] && ctl.selected[pkg].profile) || "0";
     return fetch("/api/control/plan", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ package: pkg, action: action })
+      body: JSON.stringify({ package: pkg, action: action, user: user })
     }).then(function (r) { return r.json().then(function (j) {
       return r.ok ? j : { package: pkg, action: action, blocked: j.error }; }); });
   })).then(function (plans) { ctlShowModal(action, plans); });
@@ -1778,7 +1815,7 @@ function ctlRunPending() {
   Promise.all(runnable.map(function (p) {
     return fetch("/api/control/apply", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ package: p.package, action: action })
+      body: JSON.stringify({ package: p.package, action: action, user: p.user || "0" })
     }).then(function (r) { return r.json().then(function (j) {
       if (r.ok && j.ok) done++; else failed++; }); })
       .catch(function () { failed++; });
